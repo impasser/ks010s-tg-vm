@@ -3,7 +3,10 @@ import string
 import logging
 from datetime import datetime, timezone
 from azure.identity import DefaultAzureCredential
-from azure.mgmt.resource import ResourceManagementClient
+try:
+    from azure.mgmt.resource.resources import ResourceManagementClient
+except (ImportError, AttributeError):
+    from azure.mgmt.resource import ResourceManagementClient
 from azure.mgmt.compute import ComputeManagementClient
 from azure.mgmt.network import NetworkManagementClient
 import config

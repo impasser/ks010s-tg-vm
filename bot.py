@@ -5,13 +5,18 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
     CopyTextButton,
+    BotCommand,
 )
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 import config
 from azure_manager import AzureVMManager
@@ -68,6 +73,17 @@ def build_main_menu(user_id: int, is_private: bool = False) -> InlineKeyboardMar
     return InlineKeyboardMarkup(keyboard)
 
 
+def build_persistent_reply_keyboard(user_id: int, is_private: bool = False) -> ReplyKeyboardMarkup:
+    """建置輸入框下方的常駐底部鍵盤 (永久釘選在輸入框下方)"""
+    keyboard = [
+        ["🚀 建立 Windows VM", "🔍 查詢我的 VM"],
+        ["🗑 釋放/刪除 VM", "❓ 使用說明"],
+    ]
+    if is_admin(user_id) and is_private:
+        keyboard.append(["👑 管理員主控台"])
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
+
+
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/start 或 /help 指令"""
     user = update.effective_user
@@ -102,6 +118,14 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     reply_markup = build_main_menu(user.id, is_private=is_private)
     await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode="Markdown")
+
+    # 若在私聊視窗，同時啟用底部常駐鍵盤 (永久釘選在輸入框下方)
+    if is_private:
+        await update.message.reply_text(
+            "⌨️ **底部常駐按鈕已為您啟用！**\n隨時點選下方大按鈕即可操作，無需手動輸入指令：",
+            reply_markup=build_persistent_reply_keyboard(user.id, is_private=True),
+            parse_mode="Markdown"
+        )
 
 
 async def create_vm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -468,6 +492,43 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
 
+async def text_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """處理底部常駐鍵盤發送的文字按鈕"""
+    if not update.message or not update.message.text:
+        return
+    text = update.message.text.strip()
+    user = update.effective_user
+    chat = update.effective_chat
+
+    if text == "🚀 建立 Windows VM":
+        await process_create_vm(update.message, user, chat, context)
+    elif text == "🔍 查詢我的 VM":
+        await my_vm_handler(update, context)
+    elif text == "🗑 釋放/刪除 VM":
+        await delete_vm_handler(update, context)
+    elif text == "❓ 使用說明":
+        await start_handler(update, context)
+    elif text == "👑 管理員主控台":
+        await admin_handler(update, context)
+
+
+async def new_chat_members_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """當機器人被加入新群組時，自動在群內發送歡迎訊息與操作指南"""
+    if not update.message or not update.message.new_chat_members:
+        return
+    bot_user = await context.bot.get_me()
+    for member in update.message.new_chat_members:
+        if member.id == bot_user.id:
+            welcome_text = (
+                "👋 **大家好！我是 Azure 臨時 Windows VM 管理機器人。**\n\n"
+                "專為團隊提供臨時 Windows 測試主機（附隨機密碼、2 小時自動銷毀與定時防呆關機）。\n\n"
+                "💡 **點擊下方按鈕或對話框左下角的「Menu」選單即可立即操作：**"
+            )
+            reply_markup = build_main_menu(member.id, is_private=False)
+            await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode="Markdown")
+            break
+
+
 async def delete_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """處理使用者點擊刪除按鈕的事件 (del:*)"""
     query = update.callback_query
@@ -679,14 +740,34 @@ async def execute_deletion(message, rg_name: str, ip: str, user, is_edit: bool =
         await message.reply_text(success_text, parse_mode="Markdown")
 
 
+async def post_init(application):
+    """程式啟動後自動向 Telegram 註冊官方指令選單 (左下角 Menu 快捷鍵)"""
+    commands = [
+        BotCommand("create_vm", "建立臨時 Windows (限群組)"),
+        BotCommand("my_vm", "查詢我的 VM 狀態與剩餘時間"),
+        BotCommand("delete_vm", "提前手動釋放 VM (按鈕選單)"),
+        BotCommand("help", "顯示說明選單與功能按鈕"),
+    ]
+    try:
+        await application.bot.set_my_commands(commands)
+        logger.info("已成功向 Telegram 官方註冊快捷指令選單 (Menu 按鈕)")
+    except Exception as e:
+        logger.warning(f"向 Telegram 註冊指令選單時出現警告: {e}")
+
+
 def main():
     if not config.TELEGRAM_BOT_TOKEN:
         raise ValueError("錯誤：未配置 TELEGRAM_BOT_TOKEN 環境變數！")
     if not config.AZURE_SUBSCRIPTION_ID:
         raise ValueError("錯誤：未配置 AZURE_SUBSCRIPTION_ID 環境變數！")
 
-    logger.info("啟動 Telegram Azure 臨時 VM 機器人 (v1.3 - 互動按鈕與一鍵剪貼簿版)...")
-    app = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).build()
+    logger.info("啟動 Telegram Azure 臨時 VM 機器人 (v1.5 - 常駐底部鍵盤與官方 Menu 選單版)...")
+    app = (
+        ApplicationBuilder()
+        .token(config.TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     # 註冊指令處理器
     app.add_handler(CommandHandler(["start", "help"], start_handler))
@@ -695,6 +776,19 @@ def main():
     app.add_handler(CommandHandler("delete_vm", delete_vm_handler))
     app.add_handler(CommandHandler(["admin", "all_vms"], admin_handler))
     app.add_handler(CommandHandler("extend", extend_handler))
+
+    # 註冊底部常駐鍵盤的文字按鈕處理器
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.Regex(r"^(🚀 建立 Windows VM|🔍 查詢我的 VM|🗑 釋放/刪除 VM|❓ 使用說明|👑 管理員主控台)$"),
+            text_button_handler
+        )
+    )
+
+    # 註冊機器人加入群組時的自動打招呼歡迎處理器
+    app.add_handler(
+        MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_chat_members_handler)
+    )
 
     # 註冊互動按鈕回呼處理器
     app.add_handler(CallbackQueryHandler(menu_callback_handler, pattern=r"^btn_"))

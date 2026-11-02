@@ -49,8 +49,8 @@ def is_chat_authorized(chat_id: int) -> bool:
     return chat_id in config.ALLOWED_GROUPS or chat_id > 0  # chat_id > 0 代表私聊
 
 
-def build_main_menu(user_id: int) -> InlineKeyboardMarkup:
-    """建置使用者/管理員的主功能互動按鈕選單"""
+def build_main_menu(user_id: int, is_private: bool = False) -> InlineKeyboardMarkup:
+    """建置使用者/管理員的主功能互動按鈕選單 (管理員按鈕僅限私聊顯示)"""
     keyboard = [
         [
             InlineKeyboardButton("🚀 建立 Windows VM", callback_data="btn_create_vm"),
@@ -60,7 +60,8 @@ def build_main_menu(user_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("🗑 釋放/刪除 VM", callback_data="btn_delete_vm"),
         ]
     ]
-    if is_admin(user_id):
+    # 只有在私聊且是超級管理員時，才顯示管理員控制台按鈕，群組內完全隱藏
+    if is_admin(user_id) and is_private:
         keyboard.append([
             InlineKeyboardButton("👑 管理員主控台 (延長/強制刪除/全域)", callback_data="btn_admin")
         ])
@@ -70,6 +71,9 @@ def build_main_menu(user_id: int) -> InlineKeyboardMarkup:
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/start 或 /help 指令"""
     user = update.effective_user
+    chat = update.effective_chat
+    is_private = (chat.type == "private" or chat.id > 0)
+
     welcome_text = (
         f"👋 你好，{user.first_name}！\n\n"
         "我是 **Azure 臨時 Windows VM 管理機器人**。\n\n"
@@ -89,14 +93,14 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"3. **自動銷毀**：建立後 **{config.DEFAULT_LIFETIME_HOURS} 小時** 將自動刪除並推播通知。\n"
         f"4. **自動關機**：每天 **{config.AUTO_SHUTDOWN_TIME[:2]}:{config.AUTO_SHUTDOWN_TIME[2:]}** 強制自動關機以節省開銷。"
     )
-    # 若是超級管理員，追加管理員專屬指令說明
-    if is_admin(user.id):
+    # 只有在「私聊視窗」且「是超級管理員」時，才追加管理員專屬功能說明
+    if is_admin(user.id) and is_private:
         welcome_text += (
             "\n\n👑 **超級管理員專屬功能：**\n"
             "• `/admin` 或 `/all_vms` - 開啟全域主控台 (查閱所有同事的 VM、一鍵延長、強制刪除)\n"
             "• `/extend <1|2|IP> [小時]` - 為指定機器延長使用時間 (例如 `/extend 1 2`)"
         )
-    reply_markup = build_main_menu(user.id)
+    reply_markup = build_main_menu(user.id, is_private=is_private)
     await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode="Markdown")
 
 
@@ -279,6 +283,8 @@ async def auto_delete_job_callback(context: ContextTypes.DEFAULT_TYPE):
 async def my_vm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/my_vm 查詢自己的 VM 狀態 (包含一鍵複製 IP 與操作按鈕)"""
     user = update.effective_user
+    chat = update.effective_chat
+    is_private = (chat.type == "private" or chat.id > 0)
     user_vms = [(rg, info) for rg, info in ACTIVE_VMS.items() if info["user_id"] == user.id]
 
     if not user_vms:
@@ -307,7 +313,8 @@ async def my_vm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton(f"📋 複製 #{idx} IP", copy_text=CopyTextButton(info["ip"])),
             InlineKeyboardButton(f"🗑 刪除 #{idx}", callback_data=f"del:{rg}")
         ]
-        if is_admin(user.id):
+        # 延長按鈕只有在私聊時才顯示給管理員
+        if is_admin(user.id) and is_private:
             row.append(InlineKeyboardButton(f"⏱ 延長 +1h", callback_data=f"adm_ext:{rg}:1"))
         keyboard.append(row)
 
@@ -401,6 +408,7 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     if data == "btn_my_vm":
         await query.answer()
+        is_private = (chat.type == "private" or chat.id > 0)
         user_vms = [(rg, info) for rg, info in ACTIVE_VMS.items() if info["user_id"] == user.id]
         if not user_vms:
             keyboard = [[InlineKeyboardButton("🚀 立即建立 Windows", callback_data="btn_create_vm")]]
@@ -424,7 +432,7 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 InlineKeyboardButton(f"📋 複製 #{idx} IP", copy_text=CopyTextButton(info["ip"])),
                 InlineKeyboardButton(f"🗑 刪除 #{idx}", callback_data=f"del:{rg}")
             ]
-            if is_admin(user.id):
+            if is_admin(user.id) and is_private:
                 row.append(InlineKeyboardButton(f"⏱ 延長 +1h", callback_data=f"adm_ext:{rg}:1"))
             keyboard.append(row)
         keyboard.append([InlineKeyboardButton("🔄 刷新狀態", callback_data="btn_my_vm")])
@@ -490,8 +498,17 @@ async def delete_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/admin 或 /all_vms 管理員總覽控制面板"""
     user = update.effective_user
+    chat = update.effective_chat
     if not is_admin(user.id):
         await update.message.reply_text("⛔ 您沒有管理員權限。")
+        return
+
+    # 若在群組發送，提示轉移至私聊，防止在公開群組洩漏同事的主機 IP 與資源
+    if chat.type != "private" and chat.id < 0:
+        await update.message.reply_text(
+            "🔒 **為保護伺服器資訊安全，管理員主控台僅限私聊使用。**\n請點擊機器人名稱進入私聊視窗，並輸入 `/admin` 開啟主控台。",
+            parse_mode="Markdown"
+        )
         return
 
     text, reply_markup = build_admin_panel()

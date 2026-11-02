@@ -548,7 +548,7 @@ def main():
     if not config.AZURE_SUBSCRIPTION_ID:
         raise ValueError("錯誤：未配置 AZURE_SUBSCRIPTION_ID 環境變數！")
 
-    logger.info("啟動 Telegram Azure 臨時 VM 機器人...")
+    logger.info("啟動 Telegram Azure 臨時 VM 機器人 (v1.2 - 已套用 ARM properties 修復)...")
     app = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).build()
 
     # 註冊指令處理器

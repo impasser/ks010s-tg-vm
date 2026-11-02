@@ -1,0 +1,24 @@
+services:
+  azure-vm-bot:
+    build: .
+    container_name: tg-azure-vm-bot
+    restart: always
+    environment:
+      # 必填設定
+      - TELEGRAM_BOT_TOKEN=你的TelegramBotToken
+      - AZURE_SUBSCRIPTION_ID=你的Azure訂用帳戶ID
+      - ALLOWED_USERS=123456789,987654321
+      - ADMIN_USERS=123456789
+      
+      # 外部容器部署專用 (Service Principal 憑證)
+      - AZURE_TENANT_ID=你的TenantID
+      - AZURE_CLIENT_ID=你的ClientID
+      - AZURE_CLIENT_SECRET=你的ClientSecret
+
+      # 可選調整
+      - AZURE_LOCATION=eastasia
+      - DEFAULT_VM_SIZE=Standard_B2s
+      - OS_DISK_TYPE=StandardSSD_LRS
+      - DEFAULT_LIFETIME_HOURS=2
+      - MAX_VMS_PER_USER=2
+      - MAX_TOTAL_VMS=2

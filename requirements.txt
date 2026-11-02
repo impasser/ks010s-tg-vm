@@ -1,0 +1,7 @@
+python-telegram-bot>=20.0
+azure-identity>=1.15.0
+azure-mgmt-resource>=23.1.0
+azure-mgmt-compute>=31.0.0
+azure-mgmt-network>=25.3.0
+apscheduler>=3.10.0
+python-dotenv>=1.0.0

@@ -67,14 +67,24 @@ class AzureVMManager:
         logger.info(f"建立網路拓撲: {rg_name}...")
         vnet_name = f"vnet-{suffix}"
         subnet_name = "default"
+        vnet_params = {
+            "location": location,
+            "properties": {
+                "addressSpace": {"addressPrefixes": ["10.0.0.0/16"]},
+                "subnets": [
+                    {
+                        "name": subnet_name,
+                        "properties": {
+                            "addressPrefix": "10.0.0.0/24"
+                        }
+                    }
+                ]
+            }
+        }
         vnet_poller = self.network_client.virtual_networks.begin_create_or_update(
             rg_name,
             vnet_name,
-            {
-                "location": location,
-                "address_space": {"address_prefixes": ["10.0.0.0/16"]},
-                "subnets": [{"name": subnet_name, "address_prefix": "10.0.0.0/24"}]
-            }
+            vnet_params
         )
         vnet_result = vnet_poller.result()
         subnet_ref = vnet_result.subnets[0].id
@@ -84,19 +94,23 @@ class AzureVMManager:
         source_address_prefix = allowed_ip if allowed_ip else "*"
         nsg_params = {
             "location": location,
-            "security_rules": [
-                {
-                    "name": "Allow-RDP",
-                    "protocol": "Tcp",
-                    "source_port_range": "*",
-                    "destination_port_range": "3389",
-                    "source_address_prefix": source_address_prefix,
-                    "destination_address_prefix": "*",
-                    "access": "Allow",
-                    "priority": 1000,
-                    "direction": "Inbound"
-                }
-            ]
+            "properties": {
+                "securityRules": [
+                    {
+                        "name": "Allow-RDP",
+                        "properties": {
+                            "protocol": "Tcp",
+                            "sourcePortRange": "*",
+                            "destinationPortRange": "3389",
+                            "sourceAddressPrefix": source_address_prefix,
+                            "destinationAddressPrefix": "*",
+                            "access": "Allow",
+                            "priority": 1000,
+                            "direction": "Inbound"
+                        }
+                    }
+                ]
+            }
         }
         nsg_poller = self.network_client.network_security_groups.begin_create_or_update(
             rg_name, nsg_name, nsg_params
@@ -107,8 +121,10 @@ class AzureVMManager:
         pip_name = f"pip-{suffix}"
         pip_params = {
             "location": location,
-            "public_ip_allocation_method": "Static",
-            "sku": {"name": "Standard"}
+            "sku": {"name": "Standard"},
+            "properties": {
+                "publicIPAllocationMethod": "Static"
+            }
         }
         pip_poller = self.network_client.public_ip_addresses.begin_create_or_update(
             rg_name, pip_name, pip_params
@@ -119,14 +135,18 @@ class AzureVMManager:
         nic_name = f"nic-{suffix}"
         nic_params = {
             "location": location,
-            "ip_configurations": [
-                {
-                    "name": "ipconfig1",
-                    "subnet": {"id": subnet_ref},
-                    "public_ip_address": {"id": pip_result.id}
-                }
-            ],
-            "network_security_group": {"id": nsg_result.id}
+            "properties": {
+                "ipConfigurations": [
+                    {
+                        "name": "ipconfig1",
+                        "properties": {
+                            "subnet": {"id": subnet_ref},
+                            "publicIPAddress": {"id": pip_result.id}
+                        }
+                    }
+                ],
+                "networkSecurityGroup": {"id": nsg_result.id}
+            }
         }
         nic_poller = self.network_client.network_interfaces.begin_create_or_update(
             rg_name, nic_name, nic_params
@@ -137,30 +157,32 @@ class AzureVMManager:
         logger.info(f"正在配置 Windows 11 虛擬主機 {vm_name}...")
         vm_params = {
             "location": location,
-            "hardware_profile": {"vm_size": config.DEFAULT_VM_SIZE},
-            "storage_profile": {
-                "image_reference": {
-                    "publisher": config.IMAGE_PUBLISHER,
-                    "offer": config.IMAGE_OFFER,
-                    "sku": config.IMAGE_SKU,
-                    "version": config.IMAGE_VERSION
+            "properties": {
+                "hardwareProfile": {"vmSize": config.DEFAULT_VM_SIZE},
+                "storageProfile": {
+                    "imageReference": {
+                        "publisher": config.IMAGE_PUBLISHER,
+                        "offer": config.IMAGE_OFFER,
+                        "sku": config.IMAGE_SKU,
+                        "version": config.IMAGE_VERSION
+                    },
+                    "osDisk": {
+                        "createOption": "FromImage",
+                        "managedDisk": {"storageAccountType": config.OS_DISK_TYPE}
+                    }
                 },
-                "os_disk": {
-                    "create_option": "FromImage",
-                    "managed_disk": {"storage_account_type": config.OS_DISK_TYPE}
+                "osProfile": {
+                    "computerName": vm_name[:15],  # NetBIOS 名稱最多 15 字元
+                    "adminUsername": admin_username,
+                    "adminPassword": admin_password,
+                    "windowsConfiguration": {
+                        "provisionVMAgent": True,
+                        "enableAutomaticUpdates": False
+                    }
+                },
+                "networkProfile": {
+                    "networkInterfaces": [{"id": nic_result.id}]
                 }
-            },
-            "os_profile": {
-                "computer_name": vm_name[:15],  # NetBIOS 名稱最多 15 字元
-                "admin_username": admin_username,
-                "admin_password": admin_password,
-                "windows_configuration": {
-                    "provision_vm_agent": True,
-                    "enable_automatic_updates": False
-                }
-            },
-            "network_profile": {
-                "network_interfaces": [{"id": nic_result.id}]
             }
         }
         vm_poller = self.compute_client.virtual_machines.begin_create_or_update(

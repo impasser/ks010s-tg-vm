@@ -7,6 +7,9 @@ load_dotenv()
 # Telegram 設定
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
+# Azure 訂用帳戶 ID (Subscription ID)
+AZURE_SUBSCRIPTION_ID = os.getenv("AZURE_SUBSCRIPTION_ID", "")
+
 # 白名單：允許可操作的 Telegram User ID (數字列表，以逗號分隔，例如 "12345678,87654321")
 ALLOWED_USERS_RAW = os.getenv("ALLOWED_USERS", "")
 ALLOWED_USERS = set(

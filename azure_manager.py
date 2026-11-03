@@ -246,6 +246,9 @@ class AzureVMManager:
             self.resource_client.resource_groups.begin_delete(rg_name)
             return True
         except Exception as e:
+            if "ResourceGroupNotFound" in str(e) or "not found" in str(e).lower():
+                logger.info(f"資源群組 {rg_name} 在 Azure 上已不存在 (先前已完成銷毀)。")
+                return True
             logger.error(f"刪除資源群組 {rg_name} 失敗: {e}")
             return False
 

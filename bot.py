@@ -289,10 +289,14 @@ async def auto_delete_job_callback(context: ContextTypes.DEFAULT_TYPE):
     chat_id = job_data["chat_id"]
     username = job_data["username"]
 
-    logger.info(f"借用期滿，正在銷毀資源群組 {rg_name}...")
-    await asyncio.to_thread(azure_mgr.delete_vm_resource_group, rg_name)
+    # 防呆檢查：若該主機已提前手動釋放 (已不在 ACTIVE_VMS 中)，直接返回，不重複調用 Azure 也不重複發通知
+    if rg_name not in ACTIVE_VMS:
+        logger.info(f"主機 {rg_name} 先前已提前手動釋放，跳過逾期定時銷毀。")
+        return
 
+    logger.info(f"借用期滿，正在銷毀資源群組 {rg_name}...")
     ACTIVE_VMS.pop(rg_name, None)
+    await asyncio.to_thread(azure_mgr.delete_vm_resource_group, rg_name)
 
     msg = (
         f"⏳ **【逾期自動銷毀通知】**\n"
@@ -383,7 +387,7 @@ async def delete_vm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        await execute_deletion(update.message, target_rg, target_info["ip"], user)
+        await execute_deletion(update.message, target_rg, target_info["ip"], user, context=context)
         return
 
     # 2. 如果沒帶參數，且只有 1 台
@@ -553,7 +557,7 @@ async def delete_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         return
 
     ip = info["ip"]
-    await execute_deletion(query.message, rg_name, ip, user, is_edit=True)
+    await execute_deletion(query.message, rg_name, ip, user, is_edit=True, context=context)
 
 
 async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -720,6 +724,13 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         ip = info["ip"]
         creator = info["username"]
         ACTIVE_VMS.pop(rg_name, None)
+
+        # 取消定時銷毀任務
+        if context and context.job_queue:
+            for job in context.job_queue.get_jobs_by_name(rg_name):
+                job.schedule_removal()
+                logger.info(f"已取消主機 {rg_name} 的到期定時銷毀任務")
+
         await asyncio.to_thread(azure_mgr.delete_vm_resource_group, rg_name)
         await query.message.reply_text(f"🗑 管理員已強制銷毀 @{creator} 的主機 (IP: `{ip}`)！")
         # 刷新面板
@@ -728,9 +739,17 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         return
 
 
-async def execute_deletion(message, rg_name: str, ip: str, user, is_edit: bool = False):
-    """執行後台刪除並回報結果"""
+async def execute_deletion(message, rg_name: str, ip: str, user, is_edit: bool = False, context: ContextTypes.DEFAULT_TYPE = None):
+    """執行後台刪除並回報結果 (自動取消 JobQueue 定時銷毀排程)"""
     ACTIVE_VMS.pop(rg_name, None)
+
+    # 取消 JobQueue 中的自動銷毀計時器
+    if context and context.job_queue:
+        current_jobs = context.job_queue.get_jobs_by_name(rg_name)
+        for job in current_jobs:
+            job.schedule_removal()
+            logger.info(f"已取消主機 {rg_name} 的到期定時銷毀任務")
+
     await asyncio.to_thread(azure_mgr.delete_vm_resource_group, rg_name)
 
     success_text = f"✅ 已成功銷毀 @{user.username or user.first_name} 的主機 (IP: `{ip}`)，Azure 資源已全數釋放！"

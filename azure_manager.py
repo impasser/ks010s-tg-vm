@@ -238,31 +238,53 @@ class AzureVMManager:
         except Exception as e:
             logger.warning(f"配置自動關機排程時出現警告 (非致命): {e}")
 
-    def delete_vm_resource_group(self, rg_name: str):
+    def delete_vm_resource_group(self, rg_name: str) -> tuple[bool, str]:
         """直接刪除整個 Resource Group，徹底清空硬碟、網卡、IP 等所有計費資源"""
-        logger.info(f"正在刪除資源群組: {rg_name}...")
+        logger.info(f"正在向 Azure 發送刪除命令: {rg_name}...")
         try:
             # 非同步發送刪除命令，不阻塞本機進程
             self.resource_client.resource_groups.begin_delete(rg_name)
-            return True
+            return True, "Success"
         except Exception as e:
-            if "ResourceGroupNotFound" in str(e) or "not found" in str(e).lower():
+            err_msg = str(e)
+            if "ResourceGroupNotFound" in err_msg or "not found" in err_msg.lower():
                 logger.info(f"資源群組 {rg_name} 在 Azure 上已不存在 (先前已完成銷毀)。")
-                return True
+                return True, "AlreadyDeleted"
             logger.error(f"刪除資源群組 {rg_name} 失敗: {e}")
-            return False
+            return False, err_msg
 
-    def list_active_temp_rgs(self) -> list:
-        """列出當前由機器人建立且仍在運行的資源群組"""
-        active_rgs = []
+    def check_rg_status(self, rg_name: str) -> dict:
+        """檢查特定資源群組在 Azure 上的即時存在性與佈署狀態"""
+        try:
+            if not self.resource_client.resource_groups.check_existence(rg_name):
+                return {"exists": False, "state": "Deleted"}
+            rg = self.resource_client.resource_groups.get(rg_name)
+            state = rg.properties.provisioning_state if rg.properties else "Unknown"
+            return {"exists": True, "state": state}
+        except Exception as e:
+            err_msg = str(e)
+            if "ResourceGroupNotFound" in err_msg or "not found" in err_msg.lower():
+                return {"exists": False, "state": "Deleted"}
+            logger.warning(f"檢查資源群組 {rg_name} 狀態失敗: {e}")
+            return {"exists": True, "state": "Error"}
+
+    def list_all_bot_rgs_in_azure(self) -> list:
+        """直接向 Azure 訂閱查詢所有由本機器人建立的資源群組 (以 rg-tempvm- 開頭或帶 Tag)"""
+        found = []
         try:
             for rg in self.resource_client.resource_groups.list():
-                if rg.tags and rg.tags.get("ManagedBy") == "TelegramTempVMBot":
-                    active_rgs.append({
+                is_bot_rg = (
+                    rg.name.startswith("rg-tempvm-") or
+                    (rg.tags and rg.tags.get("ManagedBy") == "TelegramTempVMBot")
+                )
+                if is_bot_rg:
+                    state = rg.properties.provisioning_state if rg.properties else "Active"
+                    found.append({
                         "name": rg.name,
-                        "created_by": rg.tags.get("CreatedBy"),
-                        "created_at": rg.tags.get("CreatedAt")
+                        "created_by": rg.tags.get("CreatedBy", "未知") if rg.tags else "未知",
+                        "created_at": rg.tags.get("CreatedAt", "") if rg.tags else "",
+                        "state": state
                     })
         except Exception as e:
-            logger.error(f"查詢資源群組失敗: {e}")
-        return active_rgs
+            logger.error(f"對帳查詢 Azure 資源群組清單失敗: {e}")
+        return found

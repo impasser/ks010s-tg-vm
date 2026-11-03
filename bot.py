@@ -294,18 +294,81 @@ async def auto_delete_job_callback(context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"主機 {rg_name} 先前已提前手動釋放，跳過逾期定時銷毀。")
         return
 
-    logger.info(f"借用期滿，正在銷毀資源群組 {rg_name}...")
+    logger.info(f"借用期滿，正在向 Azure 發送銷毀資源群組命令 {rg_name}...")
+    ip = ACTIVE_VMS[rg_name].get("ip", "")
     ACTIVE_VMS.pop(rg_name, None)
-    await asyncio.to_thread(azure_mgr.delete_vm_resource_group, rg_name)
 
-    msg = (
-        f"⏳ **【逾期自動銷毀通知】**\n"
-        f"由 @{username} 申請的臨時 Windows 測試機 (`{rg_name}`) 借用期滿，已在 Azure 上完全銷毀並釋放所有計費資源。"
-    )
+    success, err_msg = await asyncio.to_thread(azure_mgr.delete_vm_resource_group, rg_name)
+
+    if success:
+        msg = (
+            f"⏳ **【逾期自動銷毀通知】**\n"
+            f"由 @{username} 申請的臨時 Windows 測試機 (`{rg_name}`) 借用期滿，已向 Azure 發送銷毀命令。\n"
+            f"🔍 *系統將在後台自動覆核雲端釋放狀態。*"
+        )
+        # 排定 70 秒後後台自動二次覆核 Azure 是否完全清空
+        context.job_queue.run_once(
+            verify_deletion_callback,
+            when=70,
+            data={"rg_name": rg_name, "chat_id": chat_id, "username": username, "ip": ip, "retry_count": 0},
+            name=f"verify_{rg_name}"
+        )
+    else:
+        msg = (
+            f"🚨 **【自動銷毀異常警報】**\n"
+            f"主機 `{rg_name}` 到期嘗試銷毀時，向 Azure 發送刪除命令失敗！\n"
+            f"錯誤原因：`{err_msg}`\n"
+            f"⚠️ 資源可能未被釋放，請管理員手動前往 Azure Portal 處理！"
+        )
+
     try:
         await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"發送銷毀通知失敗: {e}")
+
+
+async def verify_deletion_callback(context: ContextTypes.DEFAULT_TYPE):
+    """刪除後二次覆核回呼 (確認 Azure 實體是否真正清空，有異常主動警報)"""
+    data = context.job.data
+    rg_name = data["rg_name"]
+    chat_id = data["chat_id"]
+    username = data["username"]
+    ip = data.get("ip", "")
+    retry_count = data.get("retry_count", 0)
+
+    status = await asyncio.to_thread(azure_mgr.check_rg_status, rg_name)
+    logger.info(f"後台覆核資源群組 {rg_name} 狀態: {status}")
+
+    # 若已經不存在，或狀態為 Deleted，代表已經徹底清空！
+    if not status["exists"] or status["state"] == "Deleted":
+        logger.info(f"✅ Azure 雲端二次覆核確認：資源群組 {rg_name} 已徹底銷毀並釋放！")
+        return
+
+    # 若狀態仍為 Deleting (大硬碟正在釋放)，且複查次數小於 3 次，再等 60 秒複查
+    if status["state"] == "Deleting" and retry_count < 3:
+        logger.info(f"資源群組 {rg_name} 正在進行 Azure 雲端資源擦除 (Deleting)，60 秒後進行第 {retry_count + 1} 次覆核...")
+        data["retry_count"] = retry_count + 1
+        context.job_queue.run_once(
+            verify_deletion_callback,
+            when=60,
+            data=data,
+            name=f"verify_{rg_name}"
+        )
+        return
+
+    # 若超過 3 次重試依然存在，或狀態異常，發送警報
+    alert_msg = (
+        f"⚠️ **【主機銷毀二次覆核警報】**\n"
+        f"• 主機：@{username} 的 VM (`{ip}`)\n"
+        f"• 資源群組：`{rg_name}`\n"
+        f"• 目前 Azure 狀態：`{status['state']}`\n\n"
+        "系統在發送銷毀命令後進行實體覆核，發現該資源在 Azure 上仍未完全消失！\n"
+        "👉 請管理員私聊輸入 `/admin` 點擊「🧹 雲端對帳檢查」，或登入 Azure Portal 進行確認。"
+    )
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=alert_msg, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"發送覆核警報失敗: {e}")
 
 
 async def my_vm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -583,11 +646,15 @@ async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def build_admin_panel():
     """生成管理員面板的訊息與操作按鈕"""
     if not ACTIVE_VMS:
-        keyboard = [[InlineKeyboardButton("🔄 重新整理", callback_data="adm_refresh")]]
+        keyboard = [
+            [InlineKeyboardButton("🔄 重新整理", callback_data="adm_refresh")],
+            [InlineKeyboardButton("🔍 雲端實體對帳與殘留檢查", callback_data="adm_audit")]
+        ]
         return (
             f"📊 **【管理員總覽主控台】**\n\n"
             f"• 全域使用量：`0 / {config.MAX_TOTAL_VMS}` 台\n"
-            f"• 狀態：目前全團隊沒有任何正在運行的臨時 VM。",
+            f"• 狀態：目前本地追蹤沒有任何正在運行的臨時 VM。\n\n"
+            f"💡 *可點擊下方「雲端實體對帳」直接掃描 Azure 訂閱是否有遺留殘留。*",
             InlineKeyboardMarkup(keyboard)
         )
 
@@ -612,7 +679,10 @@ def build_admin_panel():
             InlineKeyboardButton(f"🗑 刪除 #{idx}", callback_data=f"adm_del:{rg}")
         ])
 
-    keyboard.append([InlineKeyboardButton("🔄 重新整理", callback_data="adm_refresh")])
+    keyboard.append([
+        InlineKeyboardButton("🔄 重新整理", callback_data="adm_refresh"),
+        InlineKeyboardButton("🔍 雲端實體對帳", callback_data="adm_audit")
+    ])
     return text, InlineKeyboardMarkup(keyboard)
 
 
@@ -715,6 +785,54 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
         return
 
+    if data == "adm_audit":
+        await query.answer("正在向 Azure 實體掃描所有資源群組...")
+        azure_rgs = await asyncio.to_thread(azure_mgr.list_all_bot_rgs_in_azure)
+
+        active_rg_names = set(ACTIVE_VMS.keys())
+        orphans = [rg for rg in azure_rgs if rg["name"] not in active_rg_names]
+
+        audit_text = (
+            f"🔍 **【Azure 雲端實體對帳報告】**\n\n"
+            f"• 機器人追蹤中：`{len(active_rg_names)}` 台\n"
+            f"• Azure 實體資源群組總數：`{len(azure_rgs)}` 個\n\n"
+        )
+
+        keyboard = []
+        if not orphans:
+            audit_text += "🟢 **對帳完畢，狀態完美！**\nAzure 上無任何未追蹤的殘留資源群組，所有歷史主機均已徹底釋放乾淨。"
+        else:
+            audit_text += f"⚠️ **發現 {len(orphans)} 個殘留/未受控的資源群組：**\n"
+            for orphan in orphans:
+                audit_text += (
+                    f"  • `{orphan['name']}`\n"
+                    f"    狀態: `{orphan['state']}` | 建立者 ID: `{orphan['created_by']}`\n"
+                )
+                keyboard.append([
+                    InlineKeyboardButton(f"🧹 一鍵清理 {orphan['name'][:22]}...", callback_data=f"adm_clean:{orphan['name']}")
+                ])
+
+        keyboard.append([InlineKeyboardButton("🔙 返回管理面板", callback_data="adm_refresh")])
+        await query.edit_message_text(audit_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        return
+
+    if data.startswith("adm_clean:"):
+        target_rg = data.replace("adm_clean:", "")
+        await query.answer(f"正在清理殘留資源群組 {target_rg}...")
+        success, err = await asyncio.to_thread(azure_mgr.delete_vm_resource_group, target_rg)
+        if success:
+            await query.message.reply_text(f"✅ 已成功向 Azure 發送清理殘留群組 `{target_rg}` 的命令！")
+        else:
+            await query.message.reply_text(f"❌ 清理 `{target_rg}` 失敗：`{err}`")
+        # 重新執行對帳
+        azure_rgs = await asyncio.to_thread(azure_mgr.list_all_bot_rgs_in_azure)
+        active_rg_names = set(ACTIVE_VMS.keys())
+        orphans = [rg for rg in azure_rgs if rg["name"] not in active_rg_names]
+        audit_text = f"🔍 **【Azure 雲端實體對帳報告】**\n\n• 殘留群組數：`{len(orphans)}` 個\n"
+        keyboard = [[InlineKeyboardButton("🔙 返回管理面板", callback_data="adm_refresh")]]
+        await query.edit_message_text(audit_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        return
+
     if data.startswith("adm_del:"):
         rg_name = data.split(":")[1]
         if rg_name not in ACTIVE_VMS:
@@ -731,8 +849,22 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
                 job.schedule_removal()
                 logger.info(f"已取消主機 {rg_name} 的到期定時銷毀任務")
 
-        await asyncio.to_thread(azure_mgr.delete_vm_resource_group, rg_name)
-        await query.message.reply_text(f"🗑 管理員已強制銷毀 @{creator} 的主機 (IP: `{ip}`)！")
+        success, err = await asyncio.to_thread(azure_mgr.delete_vm_resource_group, rg_name)
+        if success:
+            await query.message.reply_text(
+                f"🗑 管理員已成功向 Azure 發送銷毀 @{creator} 的主機 (IP: `{ip}`) 命令！\n"
+                f"🔍 *系統將在 70 秒後自動在後台進行二次覆核。*"
+            )
+            if context and context.job_queue:
+                context.job_queue.run_once(
+                    verify_deletion_callback,
+                    when=70,
+                    data={"rg_name": rg_name, "chat_id": query.message.chat.id, "username": creator, "ip": ip, "retry_count": 0},
+                    name=f"verify_{rg_name}"
+                )
+        else:
+            await query.message.reply_text(f"❌ 強制銷毀主機 {rg_name} 失敗：`{err}`")
+
         # 刷新面板
         text, reply_markup = build_admin_panel()
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
@@ -740,7 +872,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def execute_deletion(message, rg_name: str, ip: str, user, is_edit: bool = False, context: ContextTypes.DEFAULT_TYPE = None):
-    """執行後台刪除並回報結果 (自動取消 JobQueue 定時銷毀排程)"""
+    """執行後台刪除並回報結果 (自動取消 JobQueue 定時銷毀排程並排定二次覆核)"""
     ACTIVE_VMS.pop(rg_name, None)
 
     # 取消 JobQueue 中的自動銷毀計時器
@@ -750,9 +882,35 @@ async def execute_deletion(message, rg_name: str, ip: str, user, is_edit: bool =
             job.schedule_removal()
             logger.info(f"已取消主機 {rg_name} 的到期定時銷毀任務")
 
-    await asyncio.to_thread(azure_mgr.delete_vm_resource_group, rg_name)
+    success, err_msg = await asyncio.to_thread(azure_mgr.delete_vm_resource_group, rg_name)
 
-    success_text = f"✅ 已成功銷毀 @{user.username or user.first_name} 的主機 (IP: `{ip}`)，Azure 資源已全數釋放！"
+    if success:
+        success_text = (
+            f"✅ 已成功銷毀 @{user.username or user.first_name} 的主機 (IP: `{ip}`)！\n"
+            f"• 資源群組：`{rg_name}`\n"
+            f"• 狀態：Azure 已接收銷毀指令，正在釋放所有計費資源。\n"
+            f"🔍 *系統將在 70 秒後自動向 Azure 雲端二次覆核，確認是否徹底釋放乾淨。*"
+        )
+        if context and context.job_queue:
+            context.job_queue.run_once(
+                verify_deletion_callback,
+                when=70,
+                data={
+                    "rg_name": rg_name,
+                    "chat_id": message.chat.id,
+                    "username": user.username or user.first_name,
+                    "ip": ip,
+                    "retry_count": 0
+                },
+                name=f"verify_{rg_name}"
+            )
+    else:
+        success_text = (
+            f"❌ **銷毀失敗！**\n"
+            f"無法向 Azure 發送刪除命令，錯誤原因：`{err_msg}`\n"
+            f"⚠️ 資源可能未被釋放，請聯繫管理員！"
+        )
+
     if is_edit:
         await message.edit_text(success_text, parse_mode="Markdown")
     else:

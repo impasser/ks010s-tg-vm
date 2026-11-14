@@ -3,6 +3,7 @@ import secrets
 import string
 import logging
 from datetime import datetime, timezone
+from azure.core.exceptions import HttpResponseError
 from azure.identity import DefaultAzureCredential
 try:
     from azure.mgmt.resource.resources import ResourceManagementClient

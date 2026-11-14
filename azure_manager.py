@@ -1,9 +1,11 @@
 import base64
 import secrets
 import string
+import time
 import logging
 from datetime import datetime, timezone
 from azure.core.exceptions import HttpResponseError
+from azure.core.rest import HttpRequest
 from azure.identity import DefaultAzureCredential
 try:
     from azure.mgmt.resource.resources import ResourceManagementClient
@@ -39,6 +41,34 @@ class AzureVMManager:
         password_list = [upper, lower, digit, special] + remaining
         secrets.SystemRandom().shuffle(password_list)
         return "".join(password_list)
+
+    def _deploy_arm_template(self, rg_name: str, deployment_name: str, template: dict, timeout: int = 600) -> dict:
+        """透過 Microsoft.Resources/deployments 部署 ARM 範本並輪詢結果（與 Azure Portal 相同機制）。"""
+        url = (
+            f"https://management.azure.com/subscriptions/{self.subscription_id}"
+            f"/resourcegroups/{rg_name}/providers/Microsoft.Resources/deployments/{deployment_name}"
+            f"?api-version=2021-04-01"
+        )
+        req = HttpRequest("PUT", url, json={"properties": {"mode": "Incremental", "template": template}})
+        resp = self.resource_client.send_request(req)
+        if resp.status_code not in (200, 201):
+            raise RuntimeError(f"ARM 部署啟動失敗 ({resp.status_code}): {resp.text()}")
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            time.sleep(4)
+            poll_resp = self.resource_client.send_request(HttpRequest("GET", url))
+            if poll_resp.status_code != 200:
+                raise RuntimeError(f"ARM 部署查詢失敗 ({poll_resp.status_code}): {poll_resp.text()}")
+            data = poll_resp.json()
+            props = data.get("properties", {})
+            state = props.get("provisioningState")
+            if state == "Succeeded":
+                return props.get("outputs", {})
+            if state in ("Failed", "Canceled"):
+                err_info = props.get("error", {})
+                raise RuntimeError(f"ARM 部署失敗 ({state}): {err_info}")
+        raise TimeoutError(f"ARM 部署逾時 ({timeout}s)")
 
     def create_temporary_vm(
         self,
@@ -84,144 +114,159 @@ class AzureVMManager:
             else:
                 raise
 
-        # 2. 建立虛擬網路 (VNet) 與子網路 (Subnet)
-        logger.info(f"建立網路拓撲: {rg_name}...")
+        # 2. 透過 ARM 範本一次部署 VNet、NSG、Public IP、NIC 與 Windows 11 VM
+        logger.info(f"正在透過 ARM 範本部署網路與 Windows 11 虛擬主機 ({location}): {rg_name}/{vm_name}...")
         vnet_name = f"vnet-{suffix}"
         subnet_name = "default"
-        vnet_params = {
-            "location": location,
-            "properties": {
-                "addressSpace": {"addressPrefixes": ["10.0.0.0/16"]},
-                "subnets": [
-                    {
-                        "name": subnet_name,
-                        "properties": {
-                            "addressPrefix": "10.0.0.0/24"
-                        }
-                    }
-                ]
-            }
-        }
-        vnet_poller = self.network_client.virtual_networks.begin_create_or_update(
-            rg_name,
-            vnet_name,
-            vnet_params
-        )
-        vnet_result = vnet_poller.result()
-        subnet_ref = vnet_result.subnets[0].id
-
-        # 3. 建立網路安全群組 (NSG) 放行 RDP (3389)
         nsg_name = f"nsg-{suffix}"
-        source_address_prefix = allowed_ip if allowed_ip else "*"
-        nsg_params = {
-            "location": location,
-            "properties": {
-                "securityRules": [
-                    {
-                        "name": "Allow-RDP",
-                        "properties": {
-                            "protocol": "Tcp",
-                            "sourcePortRange": "*",
-                            "destinationPortRange": "3389",
-                            "sourceAddressPrefix": source_address_prefix,
-                            "destinationAddressPrefix": "*",
-                            "access": "Allow",
-                            "priority": 1000,
-                            "direction": "Inbound"
-                        }
-                    }
-                ]
-            }
-        }
-        nsg_poller = self.network_client.network_security_groups.begin_create_or_update(
-            rg_name, nsg_name, nsg_params
-        )
-        nsg_result = nsg_poller.result()
-
-        # 4. 建立公開 IP (Public IP)
         pip_name = f"pip-{suffix}"
-        pip_params = {
-            "location": location,
-            "sku": {"name": "Standard"},
-            "properties": {
-                "publicIPAllocationMethod": "Static"
-            }
-        }
-        pip_poller = self.network_client.public_ip_addresses.begin_create_or_update(
-            rg_name, pip_name, pip_params
-        )
-        pip_result = pip_poller.result()
-
-        # 5. 建立網路介面卡 (NIC)
         nic_name = f"nic-{suffix}"
-        nic_params = {
-            "location": location,
-            "properties": {
-                "ipConfigurations": [
-                    {
-                        "name": "ipconfig1",
-                        "properties": {
-                            "subnet": {"id": subnet_ref},
-                            "publicIPAddress": {"id": pip_result.id}
-                        }
-                    }
-                ],
-                "networkSecurityGroup": {"id": nsg_result.id}
-            }
-        }
-        nic_poller = self.network_client.network_interfaces.begin_create_or_update(
-            rg_name, nic_name, nic_params
-        )
-        nic_result = nic_poller.result()
+        source_address_prefix = allowed_ip if allowed_ip else "*"
 
-        # 6. 建立 Windows 11 VM
-        logger.info(f"正在配置 Windows 11 虛擬主機 {vm_name}...")
-        vm_params = {
-            "location": location,
-            "properties": {
-                "hardwareProfile": {"vmSize": config.DEFAULT_VM_SIZE},
-                "storageProfile": {
-                    "imageReference": {
-                        "publisher": config.IMAGE_PUBLISHER,
-                        "offer": config.IMAGE_OFFER,
-                        "sku": config.IMAGE_SKU,
-                        "version": config.IMAGE_VERSION
+        template = {
+            "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+            "contentVersion": "1.0.0.0",
+            "resources": [
+                {
+                    "type": "Microsoft.Network/virtualNetworks",
+                    "apiVersion": "2024-01-01",
+                    "name": vnet_name,
+                    "location": location,
+                    "properties": {
+                        "addressSpace": {"addressPrefixes": ["10.0.0.0/16"]},
+                        "subnets": [
+                            {
+                                "name": subnet_name,
+                                "properties": {"addressPrefix": "10.0.0.0/24"},
+                            }
+                        ],
                     },
-                    "osDisk": {
-                        "createOption": "FromImage",
-                        "managedDisk": {"storageAccountType": config.OS_DISK_TYPE}
-                    }
                 },
-                "osProfile": {
-                    "computerName": vm_name[:15],  # NetBIOS 名稱最多 15 字元
-                    "adminUsername": admin_username,
-                    "adminPassword": admin_password,
-                    "windowsConfiguration": {
-                        "provisionVMAgent": True,
-                        "enableAutomaticUpdates": False
-                    }
+                {
+                    "type": "Microsoft.Network/networkSecurityGroups",
+                    "apiVersion": "2020-05-01",
+                    "name": nsg_name,
+                    "location": location,
+                    "properties": {
+                        "securityRules": [
+                            {
+                                "name": "Allow-RDP",
+                                "properties": {
+                                    "protocol": "Tcp",
+                                    "sourcePortRange": "*",
+                                    "destinationPortRange": "3389",
+                                    "sourceAddressPrefix": source_address_prefix,
+                                    "destinationAddressPrefix": "*",
+                                    "access": "Allow",
+                                    "priority": 1000,
+                                    "direction": "Inbound",
+                                },
+                            }
+                        ]
+                    },
                 },
-                "networkProfile": {
-                    "networkInterfaces": [{"id": nic_result.id}]
-                }
-            }
+                {
+                    "type": "Microsoft.Network/publicIPAddresses",
+                    "apiVersion": "2023-06-01",
+                    "name": pip_name,
+                    "location": location,
+                    "sku": {"name": "Standard"},
+                    "properties": {"publicIPAllocationMethod": "Static"},
+                },
+                {
+                    "type": "Microsoft.Network/networkInterfaces",
+                    "apiVersion": "2022-11-01",
+                    "name": nic_name,
+                    "location": location,
+                    "dependsOn": [
+                        f"[resourceId('Microsoft.Network/virtualNetworks', '{vnet_name}')]",
+                        f"[resourceId('Microsoft.Network/networkSecurityGroups', '{nsg_name}')]",
+                        f"[resourceId('Microsoft.Network/publicIPAddresses', '{pip_name}')]",
+                    ],
+                    "properties": {
+                        "ipConfigurations": [
+                            {
+                                "name": "ipconfig1",
+                                "properties": {
+                                    "subnet": {
+                                        "id": f"[resourceId('Microsoft.Network/virtualNetworks/subnets', '{vnet_name}', '{subnet_name}')]"
+                                    },
+                                    "publicIPAddress": {
+                                        "id": f"[resourceId('Microsoft.Network/publicIPAddresses', '{pip_name}')]"
+                                    },
+                                },
+                            }
+                        ],
+                        "networkSecurityGroup": {
+                            "id": f"[resourceId('Microsoft.Network/networkSecurityGroups', '{nsg_name}')]"
+                        },
+                    },
+                },
+                {
+                    "type": "Microsoft.Compute/virtualMachines",
+                    "apiVersion": "2024-07-01",
+                    "name": vm_name,
+                    "location": location,
+                    "dependsOn": [
+                        f"[resourceId('Microsoft.Network/networkInterfaces', '{nic_name}')]",
+                    ],
+                    "properties": {
+                        "hardwareProfile": {"vmSize": config.DEFAULT_VM_SIZE},
+                        "storageProfile": {
+                            "imageReference": {
+                                "publisher": config.IMAGE_PUBLISHER,
+                                "offer": config.IMAGE_OFFER,
+                                "sku": config.IMAGE_SKU,
+                                "version": config.IMAGE_VERSION,
+                            },
+                            "osDisk": {
+                                "createOption": "FromImage",
+                                "managedDisk": {"storageAccountType": config.OS_DISK_TYPE},
+                            },
+                        },
+                        "osProfile": {
+                            "computerName": vm_name[:15],
+                            "adminUsername": admin_username,
+                            "adminPassword": admin_password,
+                            "windowsConfiguration": {
+                                "provisionVMAgent": True,
+                                "enableAutomaticUpdates": False,
+                            },
+                        },
+                        "networkProfile": {
+                            "networkInterfaces": [
+                                {"id": f"[resourceId('Microsoft.Network/networkInterfaces', '{nic_name}')]"}
+                            ]
+                        },
+                    },
+                },
+            ],
+            "outputs": {
+                "publicIp": {
+                    "type": "string",
+                    "value": f"[reference(resourceId('Microsoft.Network/publicIPAddresses', '{pip_name}')).ipAddress]",
+                },
+                "vmId": {
+                    "type": "string",
+                    "value": f"[resourceId('Microsoft.Compute/virtualMachines', '{vm_name}')]",
+                },
+            },
         }
-        vm_poller = self.compute_client.virtual_machines.begin_create_or_update(
-            rg_name, vm_name, vm_params
-        )
-        vm_result = vm_poller.result()
 
-        # 7. 取得最終已綁定的公網 IP 地址
-        pip_current = self.network_client.public_ip_addresses.get(rg_name, pip_name)
-        public_ip = pip_current.ip_address
+        outputs = self._deploy_arm_template(rg_name, f"deploy-{suffix}", template, timeout=600)
+        public_ip = outputs.get("publicIp", {}).get("value")
+        vm_id = outputs.get("vmId", {}).get("value")
+        if not public_ip:
+            pip_current = self.network_client.public_ip_addresses.get(rg_name, pip_name)
+            public_ip = pip_current.ip_address
 
-        # 8. 若有勾選預裝軟體，透過 CustomScriptExtension 在 OS 內靜默安裝
+        # 3. 若有勾選預裝軟體，透過 CustomScriptExtension 在 OS 內靜默安裝
         installed_software = []
         if software_keys:
             installed_software = self._install_software(rg_name, vm_name, location, software_keys)
 
-        # 9. 設定 Azure 原生「每日晚上 19:00 自動關機」排程
-        self._configure_auto_shutdown(rg_name, vm_result.id, location=location)
+        # 4. 設定 Azure 原生「每日晚上 19:00 自動關機」排程
+        self._configure_auto_shutdown(rg_name, vm_id, location=location)
 
         return {
             "resource_group": rg_name,
@@ -254,23 +299,29 @@ class AzureVMManager:
 
         logger.info(f"正在為 {vm_name} 安裝預選軟體 ({', '.join(names)})...")
         try:
-            ext_params = {
-                "location": location,
-                "properties": {
-                    "publisher": "Microsoft.Compute",
-                    "type": "CustomScriptExtension",
-                    "typeHandlerVersion": "1.10",
-                    "autoUpgradeMinorVersion": True,
-                    "settings": {},
-                    "protectedSettings": {
-                        "commandToExecute": command_to_execute
+            ext_template = {
+                "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+                "contentVersion": "1.0.0.0",
+                "resources": [
+                    {
+                        "type": "Microsoft.Compute/virtualMachines/extensions",
+                        "apiVersion": "2024-07-01",
+                        "name": f"{vm_name}/InstallSoftware",
+                        "location": location,
+                        "properties": {
+                            "publisher": "Microsoft.Compute",
+                            "type": "CustomScriptExtension",
+                            "typeHandlerVersion": "1.10",
+                            "autoUpgradeMinorVersion": True,
+                            "settings": {},
+                            "protectedSettings": {
+                                "commandToExecute": command_to_execute
+                            },
+                        },
                     }
-                }
+                ],
             }
-            ext_poller = self.compute_client.virtual_machine_extensions.begin_create_or_update(
-                rg_name, vm_name, "InstallSoftware", ext_params
-            )
-            ext_poller.result()
+            self._deploy_arm_template(rg_name, f"deploy-sw-{vm_name}", ext_template, timeout=300)
             logger.info(f"已成功為 {vm_name} 完成軟體安裝: {', '.join(names)}")
             return names
         except Exception as e:

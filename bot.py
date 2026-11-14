@@ -285,6 +285,9 @@ async def configurator_callback_handler(update: Update, context: ContextTypes.DE
 
     if action == "cfg_reg":
         new_loc = parts[2]
+        if new_loc == draft["location"]:
+            await query.answer(f"目前已選取：{new_loc}")
+            return
         draft["location"] = new_loc
         await query.answer(f"已切換區域：{new_loc}")
         text, reply_markup = build_create_wizard(draft_id, draft)

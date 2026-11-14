@@ -63,15 +63,25 @@ class AzureVMManager:
         logger.info(f"正在為 [{user_display_name}] 建立專屬資源群組: {rg_name}...")
 
         # 1. 建立獨立 Resource Group (帶上 Tag 標籤方便追蹤)
-        rg_params = {
-            "location": location,
-            "tags": {
-                "ManagedBy": "TelegramTempVMBot",
-                "CreatedBy": str(user_id),
-                "CreatedAt": datetime.now(timezone.utc).isoformat(),
-            }
+        rg_tags = {
+            "ManagedBy": "TelegramTempVMBot",
+            "CreatedBy": str(user_id),
+            "CreatedAt": datetime.now(timezone.utc).isoformat(),
         }
-        self.resource_client.resource_groups.create_or_update(rg_name, rg_params)
+        try:
+            self.resource_client.resource_groups.create_or_update(
+                rg_name, {"location": location, "tags": rg_tags}
+            )
+        except HttpResponseError as rg_err:
+            if "LocationNotAvailableForResourceGroup" in str(rg_err) and location != "eastasia":
+                logger.warning(
+                    f"區域 {location} 不支援建立 Resource Group，改用 eastasia 存放 RG 中繼資料（VM 仍建在 {location}）。"
+                )
+                self.resource_client.resource_groups.create_or_update(
+                    rg_name, {"location": "eastasia", "tags": rg_tags}
+                )
+            else:
+                raise
 
         # 2. 建立虛擬網路 (VNet) 與子網路 (Subnet)
         logger.info(f"建立網路拓撲: {rg_name}...")

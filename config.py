@@ -35,6 +35,30 @@ ALLOWED_GROUPS = set(
 # 例如: "eastasia" (東亞/香港), "japaneast" (日本東部), "southeastasia" (東南亞/新加坡)
 AZURE_LOCATION = os.getenv("AZURE_LOCATION", "eastasia")
 
+# 可供建立時選擇的區域清單 (顯示名稱, Azure Region 代碼)
+AVAILABLE_REGIONS = [
+    ("🇭🇰 香港", "eastasia"),
+    ("🇯🇵 東京", "japaneast"),
+    ("🇸🇬 新加坡", "southeastasia"),
+    ("🇹🇼 台灣", "taiwannorth"),
+    ("🇰🇷 首爾", "koreacentral"),
+    ("🇺🇸 美西", "westus2"),
+]
+
+# 可供建立時選擇的預裝軟體清單 (透過 Azure CustomScriptExtension 在背景靜默安裝)
+AVAILABLE_SOFTWARE = {
+    "chrome": {
+        "name": "🌐 Google Chrome",
+        "ps_script": (
+            "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; "
+            "$msi = \"$env:TEMP\\chrome_enterprise.msi\"; "
+            "Invoke-WebRequest -Uri 'https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi' -OutFile $msi -UseBasicParsing; "
+            "Start-Process msiexec.exe -ArgumentList \"/i `\"$msi`\" /qn /norestart\" -Wait -NoNewWindow; "
+            "Remove-Item $msi -Force -ErrorAction SilentlyContinue"
+        ),
+    }
+}
+
 # 2. 虛擬機規格 (VM Size)
 # Windows 11 建議至少 2 核心 4GB~8GB RAM:
 # - "Standard_B2s" (2 vCPU, 4GB RAM) - 便宜經濟型

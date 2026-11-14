@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import secrets
 from datetime import datetime, timedelta, timezone
 from telegram import (
     Update,
@@ -33,6 +34,9 @@ azure_mgr = AzureVMManager()
 
 # 記憶體狀態追蹤：{rg_name: {"user_id": int, "chat_id": int, "username": str, "expire_at": datetime, "ip": str}}
 ACTIVE_VMS = {}
+
+# 建立精靈草稿狀態：{draft_id: {"user_id": int, "username": str, "chat_id": int, "location": str, "software": list, "allowed_ip": str}}
+CREATION_DRAFTS = {}
 
 
 def is_user_authorized(user_id: int) -> bool:
@@ -140,8 +144,70 @@ async def create_vm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def get_region_list() -> list:
+    """取得可選區域清單，確保 config.AZURE_LOCATION 必在其中"""
+    regions = list(config.AVAILABLE_REGIONS)
+    if not any(code == config.AZURE_LOCATION for _, code in regions):
+        regions.insert(0, (f"📍 {config.AZURE_LOCATION}", config.AZURE_LOCATION))
+    return regions
+
+
+def get_region_label(region_code: str) -> str:
+    """根據區域代碼取得友善顯示名稱"""
+    for label, code in get_region_list():
+        if code == region_code:
+            return f"{label} ({code})"
+    return region_code
+
+
+def build_create_wizard(draft_id: str, draft: dict) -> tuple[str, InlineKeyboardMarkup]:
+    """建置互動式建立精靈 (可自訂區域與預裝軟體)"""
+    selected_loc = draft["location"]
+    selected_sw = draft["software"]
+    default_tag = " (預設)" if selected_loc == config.AZURE_LOCATION else ""
+
+    sw_names = [config.AVAILABLE_SOFTWARE[k]["name"] for k in selected_sw if k in config.AVAILABLE_SOFTWARE]
+    sw_display = "、".join(sw_names) if sw_names else "無 (純淨系統)"
+    ip_display = draft["allowed_ip"] if draft["allowed_ip"] else "全開放 (*)"
+
+    text = (
+        f"🛠 **請確認 @{draft['username']} 的 VM 建立選項：**\n\n"
+        f"📍 **部署區域：** `{get_region_label(selected_loc)}`{default_tag}\n"
+        f"📦 **預裝軟體：** {sw_display}\n"
+        f"🛡 **防火牆 IP：** `{ip_display}`\n\n"
+        "👇 *點擊下方按鈕可切換區域或勾選預裝軟體，確認無誤後點擊「🚀 確認開始建立」：*"
+    )
+
+    keyboard = []
+    # 1. 區域按鈕 (每行 2 個)
+    regions = get_region_list()
+    for i in range(0, len(regions), 2):
+        row = []
+        for label, code in regions[i:i + 2]:
+            prefix = "✅ " if code == selected_loc else ""
+            suffix = "(預設)" if code == config.AZURE_LOCATION else ""
+            row.append(InlineKeyboardButton(f"{prefix}{label}{suffix}", callback_data=f"cfg_reg:{draft_id}:{code}"))
+        keyboard.append(row)
+
+    # 2. 預裝軟體按鈕 (支援切換勾選)
+    sw_row = []
+    for key, item in config.AVAILABLE_SOFTWARE.items():
+        box = "☑" if key in selected_sw else "☐"
+        sw_row.append(InlineKeyboardButton(f"{box} 預裝 {item['name']}", callback_data=f"cfg_sw:{draft_id}:{key}"))
+    if sw_row:
+        keyboard.append(sw_row)
+
+    # 3. 確認與取消按鈕
+    keyboard.append([
+        InlineKeyboardButton("🚀 確認開始建立", callback_data=f"cfg_go:{draft_id}"),
+        InlineKeyboardButton("❌ 取消", callback_data=f"cfg_cancel:{draft_id}")
+    ])
+
+    return text, InlineKeyboardMarkup(keyboard)
+
+
 async def process_create_vm(message, user, chat, context: ContextTypes.DEFAULT_TYPE, allowed_ip: str = None):
-    """核心建立 VM 邏輯 (支援指令發起與按鈕點擊發起)"""
+    """核心建立 VM 入口：驗證權限與配額後，彈出區域與預裝軟體選擇精靈"""
     # 1. 強制檢查：此指令僅限於群組內執行
     if chat.type == "private" or chat.id > 0:
         await message.reply_text(
@@ -179,22 +245,115 @@ async def process_create_vm(message, user, chat, context: ContextTypes.DEFAULT_T
         )
         return
 
-    # 發送排隊確認訊息
+    # 5. 建立草稿並顯示互動設定精靈 (區域 / 預裝軟體)
+    draft_id = secrets.token_hex(4)
+    draft = {
+        "user_id": user.id,
+        "username": user.username or user.first_name,
+        "chat_id": chat.id,
+        "location": config.AZURE_LOCATION,
+        "software": [],
+        "allowed_ip": allowed_ip,
+    }
+    CREATION_DRAFTS[draft_id] = draft
+    text, reply_markup = build_create_wizard(draft_id, draft)
+    await message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+
+
+async def configurator_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """處理建立精靈的按鈕點擊事件 (cfg_*)"""
+    query = update.callback_query
+    parts = query.data.split(":")
+    action = parts[0]
+    draft_id = parts[1]
+
+    draft = CREATION_DRAFTS.get(draft_id)
+    if not draft:
+        await query.answer("⚠️ 此建立選單已過期或已完成，請重新發起 /create_vm。", show_alert=True)
+        return
+
+    # 僅允許發起者本人操作自己的設定面板
+    if query.from_user.id != draft["user_id"]:
+        await query.answer("⛔ 請勿操作其他同事的建立面板！", show_alert=True)
+        return
+
+    if action == "cfg_cancel":
+        await query.answer("已取消")
+        CREATION_DRAFTS.pop(draft_id, None)
+        await query.edit_message_text("❌ 已取消建立臨時 VM。")
+        return
+
+    if action == "cfg_reg":
+        new_loc = parts[2]
+        draft["location"] = new_loc
+        await query.answer(f"已切換區域：{new_loc}")
+        text, reply_markup = build_create_wizard(draft_id, draft)
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+        return
+
+    if action == "cfg_sw":
+        sw_key = parts[2]
+        if sw_key in draft["software"]:
+            draft["software"].remove(sw_key)
+            await query.answer("已取消勾選")
+        else:
+            draft["software"].append(sw_key)
+            await query.answer("已勾選預裝")
+        text, reply_markup = build_create_wizard(draft_id, draft)
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+        return
+
+    if action == "cfg_go":
+        CREATION_DRAFTS.pop(draft_id, None)
+
+        # 再次檢查配額 (防止在選擇期間被其他同事搶先開滿)
+        user_vms = [rg for rg, info in ACTIVE_VMS.items() if info["user_id"] == draft["user_id"]]
+        if len(user_vms) >= config.MAX_VMS_PER_USER:
+            await query.answer("⚠️ 您已達個人開機上限！", show_alert=True)
+            await query.edit_message_text(f"⚠️ 您當前已有 {len(user_vms)} 台 VM 正在運行，無法再建立。")
+            return
+        if len(ACTIVE_VMS) >= config.MAX_TOTAL_VMS:
+            await query.answer("⚠️ 系統已達全域上限！", show_alert=True)
+            await query.edit_message_text(f"⚠️ 目前系統同時運行的 VM 已達全域上限 ({config.MAX_TOTAL_VMS} 台)，請稍候。")
+            return
+
+        await query.answer("開始建立！")
+        await execute_vm_creation(query.message, draft, context)
+        return
+
+
+async def execute_vm_creation(status_message, draft: dict, context: ContextTypes.DEFAULT_TYPE):
+    """實際呼叫 Azure 建立 VM 與預裝軟體"""
+    user_id = draft["user_id"]
+    username = draft["username"]
+    chat_id = draft["chat_id"]
+    location = draft["location"]
+    software_keys = draft["software"]
+    allowed_ip = draft["allowed_ip"]
+
+    sw_names = [config.AVAILABLE_SOFTWARE[k]["name"] for k in software_keys if k in config.AVAILABLE_SOFTWARE]
+    sw_desc = "、".join(sw_names) if sw_names else "無"
+    extra_wait = "（含背景安裝預選軟體，約需 2~3 分鐘）" if software_keys else "（預計需時 1~2 分鐘）"
+
     group_msg = (
-        f"🚀 收到 **@{user.username or user.first_name}** 的建立請求！\n"
-        f"系統正在 Azure 配置全新的臨時 Windows 主機...\n"
-        "⏳ 預計需時 1~2 分鐘，建立完成後**連線 IP 與帳號密碼將透過「私聊」直接發送給您**。\n\n"
+        f"🚀 收到 **@{username}** 的建立請求！\n"
+        f"📍 **部署區域：** `{get_region_label(location)}`\n"
+        f"📦 **預裝軟體：** {sw_desc}\n\n"
+        f"系統正在 Azure 配置全新的臨時 Windows 主機{extra_wait}...\n"
+        "建立完成後**連線 IP 與帳號密碼將透過「私聊」直接發送給您**。\n\n"
         "⚠️ *請確保您曾私聊點擊過機器人的 /start，否則機器人可能無法私聊發送帳密給您。*"
     )
-    status_message = await message.reply_text(group_msg, parse_mode="Markdown")
+    await status_message.edit_text(group_msg, parse_mode="Markdown")
 
     # 非同步執行 Azure 部署，避免阻塞 Telegram 事件迴圈
     try:
         vm_data = await asyncio.to_thread(
             azure_mgr.create_temporary_vm,
-            user_id=user.id,
-            user_display_name=user.username or user.first_name,
-            allowed_ip=allowed_ip
+            user_id=user_id,
+            user_display_name=username,
+            allowed_ip=allowed_ip,
+            location=location,
+            software_keys=software_keys
         )
     except Exception as e:
         logger.error(f"建立 VM 失敗: {e}", exc_info=True)
@@ -207,13 +366,21 @@ async def process_create_vm(message, user, chat, context: ContextTypes.DEFAULT_T
 
     # 登記至運行列表
     ACTIVE_VMS[rg_name] = {
-        "user_id": user.id,
-        "chat_id": chat.id,
-        "username": user.username or user.first_name,
+        "user_id": user_id,
+        "chat_id": chat_id,
+        "username": username,
         "expire_at": expire_time,
         "ip": public_ip,
         "vm_name": vm_data["vm_name"]
     }
+
+    installed_list = vm_data.get("installed_software", [])
+    if software_keys and installed_list:
+        sw_result_text = f"{'、'.join(installed_list)} (✅ 已安裝完成)"
+    elif software_keys and not installed_list:
+        sw_result_text = f"{sw_desc} (⚠️ 背景安裝逾時或異常，請登入後手動檢查)"
+    else:
+        sw_result_text = "無"
 
     # 1. 私聊發送敏感帳密給該同事 (包含 3 個一鍵複製到剪貼簿按鈕)
     private_text = (
@@ -221,6 +388,8 @@ async def process_create_vm(message, user, chat, context: ContextTypes.DEFAULT_T
         f"🌐 **公網 IP：** `{public_ip}`\n"
         f"👤 **使用者名稱：** `{vm_data['admin_username']}`\n"
         f"🔑 **登入密碼：** `{vm_data['admin_password']}`\n"
+        f"📍 **部署區域：** `{get_region_label(location)}`\n"
+        f"📦 **預裝軟體：** {sw_result_text}\n"
         f"🛡 **防火牆限制：** `{vm_data['allowed_ip']}`\n"
         f"💻 **主機規格：** `{vm_data['vm_size']}`\n\n"
         f"⏱ **自動銷毀倒數：** {config.DEFAULT_LIFETIME_HOURS} 小時\n"
@@ -248,19 +417,21 @@ async def process_create_vm(message, user, chat, context: ContextTypes.DEFAULT_T
     private_sent = False
     try:
         await context.bot.send_message(
-            chat_id=user.id,
+            chat_id=user_id,
             text=private_text,
             reply_markup=InlineKeyboardMarkup(private_buttons),
             parse_mode="Markdown"
         )
         private_sent = True
     except Exception as e:
-        logger.warning(f"無法向用戶 {user.id} 發送私聊訊息 (可能尚未私聊過 Bot): {e}")
+        logger.warning(f"無法向用戶 {user_id} 發送私聊訊息 (可能尚未私聊過 Bot): {e}")
 
     # 2. 群組通知已就緒
     group_success_text = (
-        f"✅ **@{user.username or user.first_name}** 的臨時 Windows 建立完成！\n"
+        f"✅ **@{username}** 的臨時 Windows 建立完成！\n"
+        f"📍 區域：`{get_region_label(location)}`\n"
         f"🌐 IP：`{public_ip}`\n"
+        f"📦 預裝軟體：{sw_result_text}\n"
         f"⏳ 本機預計在 {config.DEFAULT_LIFETIME_HOURS} 小時後自動刪除。\n"
     )
     if private_sent:
@@ -277,7 +448,7 @@ async def process_create_vm(message, user, chat, context: ContextTypes.DEFAULT_T
     context.job_queue.run_once(
         auto_delete_job_callback,
         when=config.DEFAULT_LIFETIME_HOURS * 3600,
-        data={"rg_name": rg_name, "user_id": user.id, "chat_id": chat.id, "username": user.username or user.first_name},
+        data={"rg_name": rg_name, "user_id": user_id, "chat_id": chat_id, "username": username},
         name=rg_name
     )
 
@@ -968,6 +1139,7 @@ def main():
     )
 
     # 註冊互動按鈕回呼處理器
+    app.add_handler(CallbackQueryHandler(configurator_callback_handler, pattern=r"^cfg_"))
     app.add_handler(CallbackQueryHandler(menu_callback_handler, pattern=r"^btn_"))
     app.add_handler(CallbackQueryHandler(delete_callback_handler, pattern=r"^del:"))
     app.add_handler(CallbackQueryHandler(admin_callback_handler, pattern=r"^adm_"))

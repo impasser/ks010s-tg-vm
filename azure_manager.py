@@ -1,3 +1,4 @@
+import base64
 import secrets
 import string
 import logging
@@ -38,17 +39,26 @@ class AzureVMManager:
         secrets.SystemRandom().shuffle(password_list)
         return "".join(password_list)
 
-    def create_temporary_vm(self, user_id: int, user_display_name: str, allowed_ip: str = None) -> dict:
+    def create_temporary_vm(
+        self,
+        user_id: int,
+        user_display_name: str,
+        allowed_ip: str = None,
+        location: str = None,
+        software_keys: list = None
+    ) -> dict:
         """
-        為使用者建立專屬獨立 Resource Group 與 Windows 11 VM。
+        為使用者建立專屬獨立 Resource Group 與 Windows VM。
         allowed_ip: 若有傳入同事的外網 IP，NSG 僅放行該 IP；若無則全網開放。
+        location: 部署區域，預設使用 config.AZURE_LOCATION。
+        software_keys: 欲預裝的軟體代碼清單 (對應 config.AVAILABLE_SOFTWARE)。
         """
         suffix = secrets.token_hex(3)
         rg_name = f"rg-tempvm-{user_id}-{suffix}"
         vm_name = f"win11-{suffix}"
         admin_username = "azureuser"
         admin_password = self.generate_secure_password()
-        location = config.AZURE_LOCATION
+        location = location or config.AZURE_LOCATION
 
         logger.info(f"正在為 [{user_display_name}] 建立專屬資源群組: {rg_name}...")
 
@@ -194,8 +204,13 @@ class AzureVMManager:
         pip_current = self.network_client.public_ip_addresses.get(rg_name, pip_name)
         public_ip = pip_current.ip_address
 
-        # 8. 設定 Azure 原生「每日晚上 19:00 自動關機」排程
-        self._configure_auto_shutdown(rg_name, vm_result.id)
+        # 8. 若有勾選預裝軟體，透過 CustomScriptExtension 在 OS 內靜默安裝
+        installed_software = []
+        if software_keys:
+            installed_software = self._install_software(rg_name, vm_name, location, software_keys)
+
+        # 9. 設定 Azure 原生「每日晚上 19:00 自動關機」排程
+        self._configure_auto_shutdown(rg_name, vm_result.id, location=location)
 
         return {
             "resource_group": rg_name,
@@ -204,15 +219,59 @@ class AzureVMManager:
             "admin_username": admin_username,
             "admin_password": admin_password,
             "allowed_ip": source_address_prefix,
-            "vm_size": config.DEFAULT_VM_SIZE
+            "vm_size": config.DEFAULT_VM_SIZE,
+            "location": location,
+            "installed_software": installed_software,
         }
 
-    def _configure_auto_shutdown(self, rg_name: str, vm_resource_id: str):
+    def _install_software(self, rg_name: str, vm_name: str, location: str, software_keys: list) -> list:
+        """利用 Azure CustomScriptExtension 在 Windows VM 內自動背景靜默安裝預選軟體"""
+        scripts = []
+        names = []
+        for key in software_keys:
+            item = config.AVAILABLE_SOFTWARE.get(key)
+            if item:
+                scripts.append(item["ps_script"])
+                names.append(item["name"])
+
+        if not scripts:
+            return []
+
+        combined_ps = "; ".join(scripts)
+        encoded_ps = base64.b64encode(combined_ps.encode("utf-16-le")).decode("ascii")
+        command_to_execute = f"powershell -ExecutionPolicy Bypass -EncodedCommand {encoded_ps}"
+
+        logger.info(f"正在為 {vm_name} 安裝預選軟體 ({', '.join(names)})...")
+        try:
+            ext_params = {
+                "location": location,
+                "properties": {
+                    "publisher": "Microsoft.Compute",
+                    "type": "CustomScriptExtension",
+                    "typeHandlerVersion": "1.10",
+                    "autoUpgradeMinorVersion": True,
+                    "settings": {},
+                    "protectedSettings": {
+                        "commandToExecute": command_to_execute
+                    }
+                }
+            }
+            ext_poller = self.compute_client.virtual_machine_extensions.begin_create_or_update(
+                rg_name, vm_name, "InstallSoftware", ext_params
+            )
+            ext_poller.result()
+            logger.info(f"已成功為 {vm_name} 完成軟體安裝: {', '.join(names)}")
+            return names
+        except Exception as e:
+            logger.warning(f"背景安裝軟體時出現警告 (不影響 VM 開機使用): {e}")
+            return []
+
+    def _configure_auto_shutdown(self, rg_name: str, vm_resource_id: str, location: str = None):
         """利用 Azure DevTestLab Schedule 建立每日 19:00 自動關機排程"""
         try:
             schedule_name = f"shutdown-computevm-{vm_resource_id.split('/')[-1]}"
             schedule_params = {
-                "location": config.AZURE_LOCATION,
+                "location": location or config.AZURE_LOCATION,
                 "properties": {
                     "status": "Enabled",
                     "taskType": "ComputeVmShutdownTask",

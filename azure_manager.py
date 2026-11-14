@@ -86,7 +86,7 @@ class AzureVMManager:
         """
         suffix = secrets.token_hex(3)
         rg_name = f"rg-tempvm-{user_id}-{suffix}"
-        vm_name = f"win11-{suffix}"
+        vm_name = f"win-{suffix}"
         admin_username = "azureuser"
         admin_password = self.generate_secure_password()
         location = location or config.AZURE_LOCATION
@@ -114,8 +114,8 @@ class AzureVMManager:
             else:
                 raise
 
-        # 2. 透過 ARM 範本一次部署 VNet、NSG、Public IP、NIC 與 Windows 11 VM
-        logger.info(f"正在透過 ARM 範本部署網路與 Windows 11 虛擬主機 ({location}): {rg_name}/{vm_name}...")
+        # 2. 透過 ARM 範本一次部署 VNet、NSG、Public IP、NIC 與 Windows VM
+        logger.info(f"正在透過 ARM 範本部署網路與 Windows 虛擬主機 ({location}): {rg_name}/{vm_name}...")
         vnet_name = f"vnet-{suffix}"
         subnet_name = "default"
         nsg_name = f"nsg-{suffix}"

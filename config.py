@@ -32,17 +32,44 @@ ALLOWED_GROUPS = set(
 # Azure 虛擬主機設定 (區域 / 規格 / 磁碟 / 映像)
 # ==========================================
 # 1. 部署區域 (Region)
-# 例如: "eastasia" (東亞/香港), "japaneast" (日本東部), "southeastasia" (東南亞/新加坡)
-AZURE_LOCATION = os.getenv("AZURE_LOCATION", "eastasia")
+# 預設: "taiwannorth" (台灣北部)
+AZURE_LOCATION = os.getenv("AZURE_LOCATION", "taiwannorth")
 
-# 可供建立時選擇的區域清單 (顯示名稱, Azure Region 代碼)
+# 可供建立時選擇的區域清單 (顯示名稱, Azure Region 代碼) - 亞洲常用區域優先排序
 AVAILABLE_REGIONS = [
-    ("🇭🇰 香港", "eastasia"),
-    ("🇯🇵 東京", "japaneast"),
-    ("🇸🇬 新加坡", "southeastasia"),
-    ("🇹🇼 台灣", "taiwannorth"),
-    ("🇰🇷 首爾", "koreacentral"),
-    ("🇺🇸 美西", "westus2"),
+    ("台灣北部(台北)", "taiwannorth"),
+    ("東亞(香港)", "eastasia"),
+    ("日本東部(東京)", "japaneast"),
+    ("東南亞(新加坡)", "southeastasia"),
+    ("韓國中部(首爾)", "koreacentral"),
+    ("澳洲東部(雪梨)", "australiaeast"),
+    ("紐西蘭北部(奧克蘭)", "newzealandnorth"),
+    ("馬來西亞西部(吉隆坡)", "malaysiawest"),
+    ("印尼中部(雅加達)", "indonesiacentral"),
+    ("印度中部(浦那)", "centralindia"),
+    ("印度中南部(海得拉巴)", "indiasouthcentral"),
+    ("美國西部2(華盛頓州)", "westus2"),
+    ("加拿大中部(多倫多)", "canadacentral"),
+    ("墨西哥中部(克雷塔羅)", "mexicocentral"),
+    ("巴西南部(聖保羅)", "brazilsouth"),
+    ("智利中部(聖地亞哥)", "chilecentral"),
+    ("英國南部(倫敦)", "uksouth"),
+    ("法國中部(巴黎)", "francecentral"),
+    ("德國中西部(法蘭克福)", "germanywestcentral"),
+    ("北歐(愛爾蘭都柏林)", "northeurope"),
+    ("瑞士北部(蘇黎世)", "switzerlandnorth"),
+    ("瑞典中部(耶夫勒)", "swedencentral"),
+    ("義大利北部(米蘭)", "italynorth"),
+    ("西班牙中部(馬德里)", "spaincentral"),
+    ("奧地利東部(維也納)", "austriaeast"),
+    ("比利時中部(布魯塞爾)", "belgiumcentral"),
+    ("丹麥東部(哥本哈根)", "denmarkeast"),
+    ("挪威東部(奧斯陸)", "norwayeast"),
+    ("波蘭中部(華沙)", "polandcentral"),
+    ("阿聯酋北部(杜拜)", "uaenorth"),
+    ("卡達中部(杜哈)", "qatarcentral"),
+    ("以色列中部(特拉維夫)", "israelcentral"),
+    ("南非北部(約翰尼斯堡)", "southafricanorth"),
 ]
 
 # 可供建立時選擇的預裝軟體清單 (透過 Azure CustomScriptExtension 在背景靜默安裝)

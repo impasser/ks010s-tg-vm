@@ -1,4 +1,5 @@
 import base64
+import re
 import secrets
 import string
 import time
@@ -49,9 +50,16 @@ class AzureVMManager:
             f"/resourcegroups/{rg_name}/providers/Microsoft.Resources/deployments/{deployment_name}"
             f"?api-version=2021-04-01"
         )
-        req = HttpRequest("PUT", url, json={"properties": {"mode": "Incremental", "template": template}})
-        resp = self.resource_client.send_request(req)
-        if resp.status_code not in (200, 201):
+        req_body = {"properties": {"mode": "Incremental", "template": template}}
+        resp = None
+        for attempt in range(3):
+            resp = self.resource_client.send_request(HttpRequest("PUT", url, json=req_body))
+            if resp.status_code in (200, 201):
+                break
+            if resp.status_code == 400 and "LocationNotAvailableForResourceType" in resp.text() and attempt < 2:
+                logger.warning(f"ARM 部署節點暫時回報 LocationNotAvailableForResourceType，2 秒後重試 ({attempt + 1}/3)...")
+                time.sleep(2)
+                continue
             raise RuntimeError(f"ARM 部署啟動失敗 ({resp.status_code}): {resp.text()}")
 
         deadline = time.monotonic() + timeout
@@ -262,8 +270,13 @@ class AzureVMManager:
 
         # 3. 若有勾選預裝軟體，透過 CustomScriptExtension 在 OS 內靜默安裝
         installed_software = []
+        rustdesk_id = None
+        rustdesk_password = None
         if software_keys:
-            installed_software = self._install_software(rg_name, vm_name, location, software_keys)
+            sw_res = self._install_software(rg_name, vm_name, location, software_keys)
+            installed_software = sw_res.get("names", [])
+            rustdesk_id = sw_res.get("rustdesk_id")
+            rustdesk_password = sw_res.get("rustdesk_password")
 
         # 4. 設定 Azure 原生「每日晚上 19:00 自動關機」排程
         self._configure_auto_shutdown(rg_name, vm_id, location=location)
@@ -278,20 +291,48 @@ class AzureVMManager:
             "vm_size": config.DEFAULT_VM_SIZE,
             "location": location,
             "installed_software": installed_software,
+            "rustdesk_id": rustdesk_id,
+            "rustdesk_password": rustdesk_password,
         }
 
-    def _install_software(self, rg_name: str, vm_name: str, location: str, software_keys: list) -> list:
+    def _get_extension_output(self, rg_name: str, vm_name: str, ext_name: str = "InstallSoftware") -> str:
+        """從 VM Extension 的 instanceView 讀取腳本標準輸出訊息"""
+        url = (
+            f"https://management.azure.com/subscriptions/{self.subscription_id}"
+            f"/resourceGroups/{rg_name}/providers/Microsoft.Compute/virtualMachines/{vm_name}"
+            f"/extensions/{ext_name}?$expand=instanceView&api-version=2024-07-01"
+        )
+        resp = self.resource_client.send_request(HttpRequest("GET", url))
+        if resp.status_code != 200:
+            return ""
+        iv = resp.json().get("properties", {}).get("instanceView", {})
+        messages = []
+        for s in iv.get("statuses", []) + iv.get("substatuses", []):
+            msg = s.get("message")
+            if msg:
+                messages.append(msg)
+        return "\n".join(messages)
+
+    def _install_software(self, rg_name: str, vm_name: str, location: str, software_keys: list) -> dict:
         """利用 Azure CustomScriptExtension 在 Windows VM 內自動背景靜默安裝預選軟體"""
         scripts = []
         names = []
+        rustdesk_password = None
+        if "rustdesk" in software_keys:
+            safe_chars = string.ascii_letters + string.digits + "@#%+=-_"
+            rustdesk_password = "".join(secrets.choice(safe_chars) for _ in range(12))
+
         for key in software_keys:
             item = config.AVAILABLE_SOFTWARE.get(key)
             if item:
-                scripts.append(item["ps_script"])
+                ps = item["ps_script"]
+                if rustdesk_password and "__RUSTDESK_PASSWORD__" in ps:
+                    ps = ps.replace("__RUSTDESK_PASSWORD__", rustdesk_password)
+                scripts.append(ps)
                 names.append(item["name"])
 
         if not scripts:
-            return []
+            return {"names": [], "rustdesk_id": None, "rustdesk_password": None}
 
         combined_ps = "; ".join(scripts)
         encoded_ps = base64.b64encode(combined_ps.encode("utf-16-le")).decode("ascii")
@@ -321,12 +362,26 @@ class AzureVMManager:
                     }
                 ],
             }
-            self._deploy_arm_template(rg_name, f"deploy-sw-{vm_name}", ext_template, timeout=300)
+            self._deploy_arm_template(rg_name, f"deploy-sw-{vm_name}", ext_template, timeout=360)
+
+            rustdesk_id = None
+            if "rustdesk" in software_keys:
+                out_text = self._get_extension_output(rg_name, vm_name, "InstallSoftware")
+                m = re.search(r"RUSTDESK_ID=([0-9]{6,})", out_text)
+                if m:
+                    rustdesk_id = m.group(1)
+                else:
+                    logger.warning(f"未能從 {vm_name} 取得 RustDesk ID，輸出內容: {out_text[:200]}")
+
             logger.info(f"已成功為 {vm_name} 完成軟體安裝: {', '.join(names)}")
-            return names
+            return {
+                "names": names,
+                "rustdesk_id": rustdesk_id,
+                "rustdesk_password": rustdesk_password if rustdesk_id else None,
+            }
         except Exception as e:
             logger.warning(f"背景安裝軟體時出現警告 (不影響 VM 開機使用): {e}")
-            return []
+            return {"names": [], "rustdesk_id": None, "rustdesk_password": None}
 
     def _configure_auto_shutdown(self, rg_name: str, vm_resource_id: str, location: str = None):
         """利用 Azure DevTestLab Schedule 建立每日 19:00 自動關機排程"""

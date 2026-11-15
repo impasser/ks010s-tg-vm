@@ -385,12 +385,26 @@ async def execute_vm_creation(status_message, draft: dict, context: ContextTypes
     else:
         sw_result_text = "無"
 
-    # 1. 私聊發送敏感帳密給該同事 (包含 3 個一鍵複製到剪貼簿按鈕)
+    rustdesk_id = vm_data.get("rustdesk_id")
+    rustdesk_pwd = vm_data.get("rustdesk_password")
+    rustdesk_section = ""
+    rustdesk_tip = ""
+    if rustdesk_id and rustdesk_pwd:
+        rustdesk_section = (
+            f"\n🖥 **RustDesk ID：** `{rustdesk_id}`\n"
+            f"🔐 **RustDesk 密碼：** `{rustdesk_pwd}`\n"
+        )
+        rustdesk_tip = "• 若使用 RustDesk 連線，輸入上方 ID 與密碼後會進入 Windows 鎖定畫面，再輸入上方 Windows 密碼登入即可。\n"
+    elif "rustdesk" in software_keys:
+        rustdesk_tip = "• RustDesk 已在背景安裝，若暫未顯示 ID 請透過 RDP 登入後開啟 RustDesk 查看。\n"
+
+    # 1. 私聊發送敏感帳密給該同事 (包含一鍵複製到剪貼簿按鈕)
     private_text = (
         "🎉 **您的臨時 Windows 測試機已就緒！**\n\n"
         f"🌐 **公網 IP：** `{public_ip}`\n"
         f"👤 **使用者名稱：** `{vm_data['admin_username']}`\n"
         f"🔑 **登入密碼：** `{vm_data['admin_password']}`\n"
+        f"{rustdesk_section}"
         f"📍 **部署區域：** `{get_region_label(location)}`\n"
         f"📦 **預裝軟體：** {sw_result_text}\n"
         f"🛡 **防火牆限制：** `{vm_data['allowed_ip']}`\n"
@@ -398,8 +412,9 @@ async def execute_vm_creation(status_message, draft: dict, context: ContextTypes
         f"⏱ **自動銷毀倒數：** {config.DEFAULT_LIFETIME_HOURS} 小時\n"
         f"🌙 **自動關機排程：** 每天 {config.AUTO_SHUTDOWN_TIME[:2]}:{config.AUTO_SHUTDOWN_TIME[2:]}\n\n"
         "💡 **連線提示：**\n"
-        "• 點擊下方按鈕可**一鍵複製** IP、帳號與密碼到剪貼簿。\n"
+        "• 點擊下方按鈕可**一鍵複製**連線資訊到剪貼簿。\n"
         "• 使用 Windows 自帶「遠端桌面連線 (mstsc.exe)」輸入 IP 即可連線。\n"
+        f"{rustdesk_tip}"
         "• 測試完畢可點擊下方按鈕或輸入 `/delete_vm` 提早釋放以節省額度。"
     )
 
@@ -411,11 +426,16 @@ async def execute_vm_creation(status_message, draft: dict, context: ContextTypes
             InlineKeyboardButton(f"📋 複製帳號 ({vm_data['admin_username']})", copy_text=CopyTextButton(vm_data["admin_username"])),
             InlineKeyboardButton("📋 複製密碼", copy_text=CopyTextButton(vm_data["admin_password"])),
         ],
-        [
-            InlineKeyboardButton("🔍 查詢剩餘時間", callback_data="btn_my_vm"),
-            InlineKeyboardButton("🗑 立即提早釋放", callback_data=f"del:{rg_name}"),
-        ]
     ]
+    if rustdesk_id and rustdesk_pwd:
+        private_buttons.append([
+            InlineKeyboardButton(f"📋 複製 RustDesk ID ({rustdesk_id})", copy_text=CopyTextButton(rustdesk_id)),
+            InlineKeyboardButton("📋 複製 RustDesk 密碼", copy_text=CopyTextButton(rustdesk_pwd)),
+        ])
+    private_buttons.append([
+        InlineKeyboardButton("🔍 查詢剩餘時間", callback_data="btn_my_vm"),
+        InlineKeyboardButton("🗑 立即提早釋放", callback_data=f"del:{rg_name}"),
+    ])
 
     private_sent = False
     try:

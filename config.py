@@ -83,7 +83,34 @@ AVAILABLE_SOFTWARE = {
             "Start-Process msiexec.exe -ArgumentList \"/i `\"$msi`\" /qn /norestart\" -Wait -NoNewWindow; "
             "Remove-Item $msi -Force -ErrorAction SilentlyContinue"
         ),
-    }
+    },
+    "rustdesk": {
+        "name": "🖥 RustDesk 遠端桌面",
+        "ps_script": (
+            "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; "
+            "$rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/rustdesk/rustdesk/releases/latest' -Headers @{'User-Agent'='PowerShell'}; "
+            "$asset = $rel.assets | Where-Object { $_.name -match 'x86_64\\.msi$' } | Select-Object -First 1; "
+            "$msi = \"$env:TEMP\\rustdesk_setup.msi\"; "
+            "Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $msi -UseBasicParsing; "
+            "Start-Process msiexec.exe -ArgumentList \"/i `\"$msi`\" /qn /norestart\" -Wait -NoNewWindow; "
+            "$rdExe = 'C:\\Program Files\\RustDesk\\rustdesk.exe'; "
+            "for ($i = 0; $i -lt 15; $i++) { if (Test-Path $rdExe) { break }; Start-Sleep -Seconds 2 }; "
+            "$svc = Get-Service -Name 'RustDesk' -ErrorAction SilentlyContinue; "
+            "if (-not $svc) { Start-Process $rdExe -ArgumentList '--install-service' -Wait -NoNewWindow }; "
+            "$svc = Get-Service -Name 'RustDesk' -ErrorAction SilentlyContinue; "
+            "if ($svc -and $svc.Status -ne 'Running') { Start-Service -Name 'RustDesk' -ErrorAction SilentlyContinue }; "
+            "Start-Sleep -Seconds 3; "
+            "& $rdExe --password '__RUSTDESK_PASSWORD__' 2>&1 | Out-Null; "
+            "$rdId = ''; "
+            "for ($i = 0; $i -lt 15; $i++) { "
+            "  $out = (& $rdExe --get-id 2>$null | Out-String).Trim(); "
+            "  if ($out -match '^[0-9]{6,}$') { $rdId = $out; break }; "
+            "  Start-Sleep -Seconds 2 "
+            "}; "
+            "Write-Output \"RUSTDESK_ID=$rdId\"; "
+            "Remove-Item $msi -Force -ErrorAction SilentlyContinue"
+        ),
+    },
 }
 
 # 2. 虛擬機規格 (VM Size)

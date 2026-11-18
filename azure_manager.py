@@ -84,20 +84,44 @@ class AzureVMManager:
         user_display_name: str,
         allowed_ip: str = None,
         location: str = None,
-        software_keys: list = None
+        software_keys: list = None,
+        os_type: str = "windows",
     ) -> dict:
         """
-        為使用者建立專屬獨立 Resource Group 與 Windows VM。
+        為使用者建立專屬獨立 Resource Group 與臨時 VM (支援 Windows / Linux)。
         allowed_ip: 若有傳入同事的外網 IP，NSG 僅放行該 IP；若無則全網開放。
         location: 部署區域，預設使用 config.AZURE_LOCATION。
-        software_keys: 欲預裝的軟體代碼清單 (對應 config.AVAILABLE_SOFTWARE)。
+        software_keys: 欲預裝的軟體代碼清單 (僅 Windows 適用，對應 config.AVAILABLE_SOFTWARE)。
+        os_type: 作業系統類型 ('windows' 或 'linux')，預設 'windows'。
         """
+        is_linux = (os_type == "linux")
         suffix = secrets.token_hex(3)
         rg_name = f"rg-tempvm-{user_id}-{suffix}"
-        vm_name = f"win-{suffix}"
+        vm_name = f"lin-{suffix}" if is_linux else f"win-{suffix}"
         admin_username = "azureuser"
         admin_password = self.generate_secure_password()
         location = location or config.AZURE_LOCATION
+
+        vm_size = config.LINUX_VM_SIZE if is_linux else config.DEFAULT_VM_SIZE
+        os_disk_type = config.LINUX_OS_DISK_TYPE if is_linux else config.OS_DISK_TYPE
+        image_ref = (
+            {
+                "publisher": config.LINUX_IMAGE_PUBLISHER,
+                "offer": config.LINUX_IMAGE_OFFER,
+                "sku": config.LINUX_IMAGE_SKU,
+                "version": config.LINUX_IMAGE_VERSION,
+            }
+            if is_linux
+            else {
+                "publisher": config.IMAGE_PUBLISHER,
+                "offer": config.IMAGE_OFFER,
+                "sku": config.IMAGE_SKU,
+                "version": config.IMAGE_VERSION,
+            }
+        )
+        nsg_rule_name = "Allow-SSH" if is_linux else "Allow-RDP"
+        nsg_port = "22" if is_linux else "3389"
+        os_label = "Linux (Debian 13)" if is_linux else "Windows"
 
         logger.info(f"正在為 [{user_display_name}] 建立專屬資源群組: {rg_name}...")
 
@@ -122,8 +146,8 @@ class AzureVMManager:
             else:
                 raise
 
-        # 2. 透過 ARM 範本一次部署 VNet、NSG、Public IP、NIC 與 Windows VM
-        logger.info(f"正在透過 ARM 範本部署網路與 Windows 虛擬主機 ({location}): {rg_name}/{vm_name}...")
+        # 2. 透過 ARM 範本一次部署 VNet、NSG、Public IP、NIC 與虛擬主機
+        logger.info(f"正在透過 ARM 範本部署網路與 {os_label} 虛擬主機 ({location}): {rg_name}/{vm_name}...")
         vnet_name = f"vnet-{suffix}"
         subnet_name = "default"
         nsg_name = f"nsg-{suffix}"
@@ -158,11 +182,11 @@ class AzureVMManager:
                     "properties": {
                         "securityRules": [
                             {
-                                "name": "Allow-RDP",
+                                "name": nsg_rule_name,
                                 "properties": {
                                     "protocol": "Tcp",
                                     "sourcePortRange": "*",
-                                    "destinationPortRange": "3389",
+                                    "destinationPortRange": nsg_port,
                                     "sourceAddressPrefix": source_address_prefix,
                                     "destinationAddressPrefix": "*",
                                     "access": "Allow",
@@ -219,27 +243,28 @@ class AzureVMManager:
                         f"[resourceId('Microsoft.Network/networkInterfaces', '{nic_name}')]",
                     ],
                     "properties": {
-                        "hardwareProfile": {"vmSize": config.DEFAULT_VM_SIZE},
+                        "hardwareProfile": {"vmSize": vm_size},
                         "storageProfile": {
-                            "imageReference": {
-                                "publisher": config.IMAGE_PUBLISHER,
-                                "offer": config.IMAGE_OFFER,
-                                "sku": config.IMAGE_SKU,
-                                "version": config.IMAGE_VERSION,
-                            },
+                            "imageReference": image_ref,
                             "osDisk": {
                                 "createOption": "FromImage",
-                                "managedDisk": {"storageAccountType": config.OS_DISK_TYPE},
+                                "managedDisk": {"storageAccountType": os_disk_type},
                             },
                         },
                         "osProfile": {
                             "computerName": vm_name[:15],
                             "adminUsername": admin_username,
                             "adminPassword": admin_password,
-                            "windowsConfiguration": {
-                                "provisionVMAgent": True,
-                                "enableAutomaticUpdates": False,
-                            },
+                            **(
+                                {"linuxConfiguration": {"disablePasswordAuthentication": False}}
+                                if is_linux
+                                else {
+                                    "windowsConfiguration": {
+                                        "provisionVMAgent": True,
+                                        "enableAutomaticUpdates": False,
+                                    }
+                                }
+                            ),
                         },
                         "networkProfile": {
                             "networkInterfaces": [
@@ -268,11 +293,11 @@ class AzureVMManager:
             pip_current = self.network_client.public_ip_addresses.get(rg_name, pip_name)
             public_ip = pip_current.ip_address
 
-        # 3. 若有勾選預裝軟體，透過 CustomScriptExtension 在 OS 內靜默安裝
+        # 3. 若有勾選預裝軟體 (僅 Windows)，透過 CustomScriptExtension 在 OS 內靜默安裝
         installed_software = []
         rustdesk_id = None
         rustdesk_password = None
-        if software_keys:
+        if not is_linux and software_keys:
             sw_res = self._install_software(rg_name, vm_name, location, software_keys)
             installed_software = sw_res.get("names", [])
             rustdesk_id = sw_res.get("rustdesk_id")
@@ -288,7 +313,8 @@ class AzureVMManager:
             "admin_username": admin_username,
             "admin_password": admin_password,
             "allowed_ip": source_address_prefix,
-            "vm_size": config.DEFAULT_VM_SIZE,
+            "vm_size": vm_size,
+            "os_type": os_type,
             "location": location,
             "installed_software": installed_software,
             "rustdesk_id": rustdesk_id,

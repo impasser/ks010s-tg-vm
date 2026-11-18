@@ -160,25 +160,51 @@ def get_region_label(region_code: str) -> str:
     return region_code
 
 
+def get_os_label(os_type: str) -> str:
+    """根據作業系統代碼取得友善顯示名稱"""
+    return "🐧 Linux (Debian 13)" if os_type == "linux" else "🪟 Windows"
+
+
 def build_create_wizard(draft_id: str, draft: dict) -> tuple[str, InlineKeyboardMarkup]:
-    """建置互動式建立精靈 (可自訂區域與預裝軟體)"""
+    """建置互動式建立精靈 (可自訂作業系統、區域與預裝軟體)"""
+    selected_os = draft.get("os_type", "windows")
     selected_loc = draft["location"]
     selected_sw = draft["software"]
     default_tag = " (預設)" if selected_loc == config.AZURE_LOCATION else ""
+    os_default_tag = " (預設)" if selected_os == "windows" else ""
 
-    sw_names = [config.AVAILABLE_SOFTWARE[k]["name"] for k in selected_sw if k in config.AVAILABLE_SOFTWARE]
-    sw_display = "、".join(sw_names) if sw_names else "無 (純淨系統)"
     ip_display = draft["allowed_ip"] if draft["allowed_ip"] else "全開放 (*)"
+    if selected_os == "linux":
+        sw_line = ""
+        hint_line = "👇 *點擊下方按鈕可切換作業系統或部署區域，確認無誤後點擊「🚀 確認開始建立」：*"
+    else:
+        sw_names = [config.AVAILABLE_SOFTWARE[k]["name"] for k in selected_sw if k in config.AVAILABLE_SOFTWARE]
+        sw_display = "、".join(sw_names) if sw_names else "無 (純淨系統)"
+        sw_line = f"📦 **預裝軟體：** {sw_display}\n"
+        hint_line = "👇 *點擊下方按鈕可切換系統、區域或勾選預裝軟體，確認無誤後點擊「🚀 確認開始建立」：*"
 
     text = (
         f"🛠 **請確認 @{draft['username']} 的 VM 建立選項：**\n\n"
+        f"💿 **作業系統：** `{get_os_label(selected_os)}`{os_default_tag}\n"
         f"📍 **部署區域：** `{get_region_label(selected_loc)}`{default_tag}\n"
-        f"📦 **預裝軟體：** {sw_display}\n"
+        f"{sw_line}"
         f"🛡 **防火牆 IP：** `{ip_display}`\n\n"
-        "👇 *點擊下方按鈕可切換區域或勾選預裝軟體，確認無誤後點擊「🚀 確認開始建立」：*"
+        f"{hint_line}"
     )
 
     keyboard = []
+    # 0. 作業系統按鈕
+    keyboard.append([
+        InlineKeyboardButton(
+            f"{'✅ ' if selected_os == 'windows' else ''}🪟 Windows(預設)",
+            callback_data=f"cfg_os:{draft_id}:windows",
+        ),
+        InlineKeyboardButton(
+            f"{'✅ ' if selected_os == 'linux' else ''}🐧 Linux (Debian 13)",
+            callback_data=f"cfg_os:{draft_id}:linux",
+        ),
+    ])
+
     # 1. 區域按鈕 (每行 2 個)
     regions = get_region_list()
     for i in range(0, len(regions), 2):
@@ -189,13 +215,14 @@ def build_create_wizard(draft_id: str, draft: dict) -> tuple[str, InlineKeyboard
             row.append(InlineKeyboardButton(f"{prefix}{label}{suffix}", callback_data=f"cfg_reg:{draft_id}:{code}"))
         keyboard.append(row)
 
-    # 2. 預裝軟體按鈕 (支援切換勾選)
-    sw_row = []
-    for key, item in config.AVAILABLE_SOFTWARE.items():
-        box = "☑" if key in selected_sw else "☐"
-        sw_row.append(InlineKeyboardButton(f"{box} 預裝 {item['name']}", callback_data=f"cfg_sw:{draft_id}:{key}"))
-    if sw_row:
-        keyboard.append(sw_row)
+    # 2. 預裝軟體按鈕 (僅 Windows 適用，支援切換勾選)
+    if selected_os == "windows":
+        sw_row = []
+        for key, item in config.AVAILABLE_SOFTWARE.items():
+            box = "☑" if key in selected_sw else "☐"
+            sw_row.append(InlineKeyboardButton(f"{box} 預裝 {item['name']}", callback_data=f"cfg_sw:{draft_id}:{key}"))
+        if sw_row:
+            keyboard.append(sw_row)
 
     # 3. 確認與取消按鈕
     keyboard.append([
@@ -251,6 +278,7 @@ async def process_create_vm(message, user, chat, context: ContextTypes.DEFAULT_T
         "user_id": user.id,
         "username": user.username or user.first_name,
         "chat_id": chat.id,
+        "os_type": "windows",
         "location": config.AZURE_LOCATION,
         "software": [],
         "allowed_ip": allowed_ip,
@@ -281,6 +309,19 @@ async def configurator_callback_handler(update: Update, context: ContextTypes.DE
         await query.answer("已取消")
         CREATION_DRAFTS.pop(draft_id, None)
         await query.edit_message_text("❌ 已取消建立臨時 VM。")
+        return
+
+    if action == "cfg_os":
+        new_os = parts[2]
+        if new_os == draft.get("os_type", "windows"):
+            await query.answer(f"目前已選取：{get_os_label(new_os)}")
+            return
+        draft["os_type"] = new_os
+        if new_os == "linux":
+            draft["software"] = []
+        await query.answer(f"已切換作業系統：{get_os_label(new_os)}")
+        text, reply_markup = build_create_wizard(draft_id, draft)
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
         return
 
     if action == "cfg_reg":
@@ -330,19 +371,24 @@ async def execute_vm_creation(status_message, draft: dict, context: ContextTypes
     user_id = draft["user_id"]
     username = draft["username"]
     chat_id = draft["chat_id"]
+    os_type = draft.get("os_type", "windows")
+    is_linux = (os_type == "linux")
+    os_label = get_os_label(os_type)
     location = draft["location"]
-    software_keys = draft["software"]
+    software_keys = [] if is_linux else draft["software"]
     allowed_ip = draft["allowed_ip"]
 
     sw_names = [config.AVAILABLE_SOFTWARE[k]["name"] for k in software_keys if k in config.AVAILABLE_SOFTWARE]
     sw_desc = "、".join(sw_names) if sw_names else "無"
     extra_wait = "（含背景安裝預選軟體，約需 2~3 分鐘）" if software_keys else "（預計需時 1~2 分鐘）"
+    sw_group_line = "" if is_linux else f"📦 **預裝軟體：** {sw_desc}\n"
 
     group_msg = (
         f"🚀 收到 **@{username}** 的建立請求！\n"
+        f"💿 **作業系統：** `{os_label}`\n"
         f"📍 **部署區域：** `{get_region_label(location)}`\n"
-        f"📦 **預裝軟體：** {sw_desc}\n\n"
-        f"系統正在 Azure 配置全新的臨時 Windows 主機{extra_wait}...\n"
+        f"{sw_group_line}\n"
+        f"系統正在 Azure 配置全新的臨時 {os_label} 主機{extra_wait}...\n"
         "建立完成後**連線 IP 與帳號密碼將透過「私聊」直接發送給您**。\n\n"
         "⚠️ *請確保您曾私聊點擊過機器人的 /start，否則機器人可能無法私聊發送帳密給您。*"
     )
@@ -356,7 +402,8 @@ async def execute_vm_creation(status_message, draft: dict, context: ContextTypes
             user_display_name=username,
             allowed_ip=allowed_ip,
             location=location,
-            software_keys=software_keys
+            software_keys=software_keys,
+            os_type=os_type,
         )
     except Exception as e:
         logger.error(f"建立 VM 失敗: {e}", exc_info=True)
@@ -374,7 +421,8 @@ async def execute_vm_creation(status_message, draft: dict, context: ContextTypes
         "username": username,
         "expire_at": expire_time,
         "ip": public_ip,
-        "vm_name": vm_data["vm_name"]
+        "vm_name": vm_data["vm_name"],
+        "os_type": os_type,
     }
 
     installed_list = vm_data.get("installed_software", [])
@@ -399,21 +447,34 @@ async def execute_vm_creation(status_message, draft: dict, context: ContextTypes
         rustdesk_tip = "• RustDesk 已在背景安裝，若暫未顯示 ID 請透過 RDP 登入後開啟 RustDesk 查看。\n"
 
     # 1. 私聊發送敏感帳密給該同事 (包含一鍵複製到剪貼簿按鈕)
+    ssh_cmd = f"ssh {vm_data['admin_username']}@{public_ip}"
+    if is_linux:
+        private_title = "🎉 **您的臨時 Linux (Debian 13) 測試機已就緒！**\n\n"
+        ssh_line = f"💻 **SSH 指令：** `{ssh_cmd}`\n"
+        sw_private_line = ""
+        connect_tip = f"• 使用終端機執行 `{ssh_cmd}`（Port `22`）並輸入上方密碼即可連線。\n"
+    else:
+        private_title = "🎉 **您的臨時 Windows 測試機已就緒！**\n\n"
+        ssh_line = ""
+        sw_private_line = f"📦 **預裝軟體：** {sw_result_text}\n"
+        connect_tip = "• 使用 Windows 自帶「遠端桌面連線 (mstsc.exe)」輸入 IP 即可連線。\n"
+
     private_text = (
-        "🎉 **您的臨時 Windows 測試機已就緒！**\n\n"
+        f"{private_title}"
         f"🌐 **公網 IP：** `{public_ip}`\n"
         f"👤 **使用者名稱：** `{vm_data['admin_username']}`\n"
         f"🔑 **登入密碼：** `{vm_data['admin_password']}`\n"
+        f"{ssh_line}"
         f"{rustdesk_section}"
         f"📍 **部署區域：** `{get_region_label(location)}`\n"
-        f"📦 **預裝軟體：** {sw_result_text}\n"
+        f"{sw_private_line}"
         f"🛡 **防火牆限制：** `{vm_data['allowed_ip']}`\n"
         f"💻 **主機規格：** `{vm_data['vm_size']}`\n\n"
         f"⏱ **自動銷毀倒數：** {config.DEFAULT_LIFETIME_HOURS} 小時\n"
         f"🌙 **自動關機排程：** 每天 {config.AUTO_SHUTDOWN_TIME[:2]}:{config.AUTO_SHUTDOWN_TIME[2:]}\n\n"
         "💡 **連線提示：**\n"
         "• 點擊下方按鈕可**一鍵複製**連線資訊到剪貼簿。\n"
-        "• 使用 Windows 自帶「遠端桌面連線 (mstsc.exe)」輸入 IP 即可連線。\n"
+        f"{connect_tip}"
         f"{rustdesk_tip}"
         "• 測試完畢可點擊下方按鈕或輸入 `/delete_vm` 提早釋放以節省額度。"
     )
@@ -427,6 +488,10 @@ async def execute_vm_creation(status_message, draft: dict, context: ContextTypes
             InlineKeyboardButton("📋 複製密碼", copy_text=CopyTextButton(vm_data["admin_password"])),
         ],
     ]
+    if is_linux:
+        private_buttons[0].append(
+            InlineKeyboardButton("📋 複製 SSH 指令", copy_text=CopyTextButton(ssh_cmd))
+        )
     if rustdesk_id and rustdesk_pwd:
         private_buttons.append([
             InlineKeyboardButton(f"📋 複製 RustDesk ID ({rustdesk_id})", copy_text=CopyTextButton(rustdesk_id)),
@@ -450,11 +515,12 @@ async def execute_vm_creation(status_message, draft: dict, context: ContextTypes
         logger.warning(f"無法向用戶 {user_id} 發送私聊訊息 (可能尚未私聊過 Bot): {e}")
 
     # 2. 群組通知已就緒
+    group_sw_done = "" if is_linux else f"📦 預裝軟體：{sw_result_text}\n"
     group_success_text = (
-        f"✅ **@{username}** 的臨時 Windows 建立完成！\n"
+        f"✅ **@{username}** 的臨時 {os_label} 建立完成！\n"
         f"📍 區域：`{get_region_label(location)}`\n"
         f"🌐 IP：`{public_ip}`\n"
-        f"📦 預裝軟體：{sw_result_text}\n"
+        f"{group_sw_done}"
         f"⏳ 本機預計在 {config.DEFAULT_LIFETIME_HOURS} 小時後自動刪除。\n"
     )
     if private_sent:

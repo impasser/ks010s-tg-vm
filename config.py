@@ -133,6 +133,14 @@ IMAGE_OFFER = os.getenv("IMAGE_OFFER", "WindowsServer")
 IMAGE_SKU = os.getenv("IMAGE_SKU", "2022-datacenter-azure-edition")  # 可選: 2022-datacenter-azure-edition, 2025-datacenter-azure-edition
 IMAGE_VERSION = os.getenv("IMAGE_VERSION", "latest")
 
+# 5. Linux 虛擬機規格與映像檔 (預設 Debian 13 "Trixie" - x64 Gen2，可透過環境變數覆寫)
+LINUX_VM_SIZE = os.getenv("LINUX_VM_SIZE", "Standard_B2s")
+LINUX_OS_DISK_TYPE = os.getenv("LINUX_OS_DISK_TYPE", "StandardSSD_LRS")
+LINUX_IMAGE_PUBLISHER = os.getenv("LINUX_IMAGE_PUBLISHER", "Debian")
+LINUX_IMAGE_OFFER = os.getenv("LINUX_IMAGE_OFFER", "debian-13")
+LINUX_IMAGE_SKU = os.getenv("LINUX_IMAGE_SKU", "13-gen2")
+LINUX_IMAGE_VERSION = os.getenv("LINUX_IMAGE_VERSION", "latest")
+
 # ==========================================
 # 生命週期與配額設定
 # ==========================================

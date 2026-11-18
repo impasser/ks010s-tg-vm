@@ -407,7 +407,10 @@ async def execute_vm_creation(status_message, draft: dict, context: ContextTypes
         )
     except Exception as e:
         logger.error(f"建立 VM 失敗: {e}", exc_info=True)
-        await status_message.edit_text(f"❌ 建立失敗，錯誤原因：`{str(e)}`", parse_mode="Markdown")
+        await status_message.edit_text(
+            f"❌ 建立失敗，已自動觸發清理本次殘留資源。\n錯誤原因：`{str(e)}`",
+            parse_mode="Markdown",
+        )
         return
 
     rg_name = vm_data["resource_group"]
@@ -1192,6 +1195,53 @@ async def post_init(application):
         logger.warning(f"向 Telegram 註冊指令選單時出現警告: {e}")
 
 
+async def auto_cleanup_orphan_rgs(context: ContextTypes.DEFAULT_TYPE):
+    """背景定時自動巡檢：清理未被追蹤且已超過生命週期 (預設 2 小時 + 15 分鐘緩衝) 的孤兒資源群組"""
+    try:
+        cloud_rgs = await asyncio.to_thread(azure_mgr.list_all_bot_rgs_in_azure)
+    except Exception as e:
+        logger.warning(f"背景巡檢 Azure 孤兒資源群組失敗: {e}")
+        return
+
+    now = datetime.now(timezone.utc)
+    max_age = timedelta(hours=config.DEFAULT_LIFETIME_HOURS, minutes=15)
+    cleaned = []
+
+    for rg in cloud_rgs:
+        rg_name = rg["name"]
+        if rg_name in ACTIVE_VMS or rg.get("state") == "Deleting":
+            continue
+        created_at_str = rg.get("created_at") or ""
+        if not created_at_str:
+            continue
+        try:
+            created_at = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+
+        if now - created_at >= max_age:
+            ok, msg = await asyncio.to_thread(azure_mgr.delete_vm_resource_group, rg_name)
+            if ok:
+                cleaned.append(rg_name)
+                logger.info(f"背景巡檢已自動清除逾時孤兒資源群組: {rg_name}")
+            else:
+                logger.warning(f"背景巡檢清除孤兒資源群組 {rg_name} 失敗: {msg}")
+
+    if cleaned:
+        notice = (
+            "🧹 **背景自動巡檢通知**\n\n"
+            f"偵測到以下超過 {config.DEFAULT_LIFETIME_HOURS} 小時且未被追蹤的殘留資源群組，已自動向 Azure 發送銷毀命令：\n"
+            + "\n".join(f"• `{name}`" for name in cleaned)
+        )
+        for admin_id in config.ADMIN_USERS:
+            try:
+                await context.bot.send_message(chat_id=admin_id, text=notice, parse_mode="Markdown")
+            except Exception as e:
+                logger.warning(f"無法私聊通知管理員 {admin_id} 背景自動清理結果: {e}")
+
+
 def main():
     if not config.TELEGRAM_BOT_TOKEN:
         raise ValueError("錯誤：未配置 TELEGRAM_BOT_TOKEN 環境變數！")
@@ -1226,6 +1276,10 @@ def main():
     app.add_handler(
         MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_chat_members_handler)
     )
+
+    # 啟動背景自動巡檢孤兒資源群組 (開機 60 秒後首次執行，之後每 30 分鐘執行一次)
+    if app.job_queue:
+        app.job_queue.run_repeating(auto_cleanup_orphan_rgs, interval=1800, first=60, name="auto_cleanup_orphan_rgs")
 
     # 註冊互動按鈕回呼處理器
     app.add_handler(CallbackQueryHandler(configurator_callback_handler, pattern=r"^cfg_"))

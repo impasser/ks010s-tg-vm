@@ -286,12 +286,20 @@ class AzureVMManager:
             },
         }
 
-        outputs = self._deploy_arm_template(rg_name, f"deploy-{suffix}", template, timeout=600)
-        public_ip = outputs.get("publicIp", {}).get("value")
-        vm_id = outputs.get("vmId", {}).get("value")
-        if not public_ip:
-            pip_current = self.network_client.public_ip_addresses.get(rg_name, pip_name)
-            public_ip = pip_current.ip_address
+        try:
+            outputs = self._deploy_arm_template(rg_name, f"deploy-{suffix}", template, timeout=600)
+            public_ip = outputs.get("publicIp", {}).get("value")
+            vm_id = outputs.get("vmId", {}).get("value")
+            if not public_ip:
+                pip_current = self.network_client.public_ip_addresses.get(rg_name, pip_name)
+                public_ip = pip_current.ip_address
+        except Exception:
+            logger.warning(f"建立 VM 失敗，正在自動清理殘留資源群組: {rg_name}...")
+            try:
+                self.delete_vm_resource_group(rg_name)
+            except Exception as cleanup_err:
+                logger.error(f"自動清理失敗的資源群組 {rg_name} 時發生錯誤: {cleanup_err}")
+            raise
 
         # 3. 若有勾選預裝軟體 (僅 Windows)，透過 CustomScriptExtension 在 OS 內靜默安裝
         installed_software = []

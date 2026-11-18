@@ -62,7 +62,7 @@ def build_main_menu(user_id: int, is_private: bool = False) -> InlineKeyboardMar
     """建置使用者/管理員的主功能互動按鈕選單 (管理員按鈕僅限私聊顯示)"""
     keyboard = [
         [
-            InlineKeyboardButton("🚀 建立 Windows VM", callback_data="btn_create_vm"),
+            InlineKeyboardButton("🚀 建立臨時 VM", callback_data="btn_create_vm"),
             InlineKeyboardButton("🔍 查詢我的 VM", callback_data="btn_my_vm"),
         ],
         [
@@ -80,7 +80,7 @@ def build_main_menu(user_id: int, is_private: bool = False) -> InlineKeyboardMar
 def build_persistent_reply_keyboard(user_id: int, is_private: bool = False) -> ReplyKeyboardMarkup:
     """建置輸入框下方的常駐底部鍵盤 (永久釘選在輸入框下方)"""
     keyboard = [
-        ["🚀 建立 Windows VM", "🔍 查詢我的 VM"],
+        ["🚀 建立臨時 VM", "🔍 查詢我的 VM"],
         ["🗑 釋放/刪除 VM", "❓ 使用說明"],
     ]
     if is_admin(user_id) and is_private:
@@ -96,11 +96,11 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     welcome_text = (
         f"👋 你好，{user.first_name}！\n\n"
-        "我是 **Azure 臨時 Windows VM 管理機器人**。\n\n"
+        "我是 **Azure 臨時 VM 管理機器人**。\n\n"
         "💡 **您可以直接點擊下方按鈕操作，亦可使用文字指令：**\n\n"
         "🛠 **可用指令：**\n"
         "• `/create_vm` 或 `/create_vm <你的外網IP>`\n"
-        "  └ 建立臨時 Windows (⚠️ **僅限群組內使用**，密碼私聊發送)\n\n"
+        "  └ 建立臨時 VM (支援 Windows / Linux，⚠️ **僅限群組內使用**，密碼私聊發送)\n\n"
         "• `/my_vm`\n"
         "  └ 查看自己擁有的 VM、IP 與剩餘倒數分鐘\n\n"
         "• `/delete_vm`\n"
@@ -563,7 +563,7 @@ async def auto_delete_job_callback(context: ContextTypes.DEFAULT_TYPE):
     if success:
         msg = (
             f"⏳ **【逾期自動銷毀通知】**\n"
-            f"由 @{username} 申請的臨時 Windows 測試機 (`{rg_name}`) 借用期滿，已向 Azure 發送銷毀命令。\n"
+            f"由 @{username} 申請的臨時測試機 (`{rg_name}`) 借用期滿，已向 Azure 發送銷毀命令。\n"
             f"🔍 *系統將在後台自動覆核雲端釋放狀態。*"
         )
         # 排定 70 秒後後台自動二次覆核 Azure 是否完全清空
@@ -639,7 +639,7 @@ async def my_vm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_vms = [(rg, info) for rg, info in ACTIVE_VMS.items() if info["user_id"] == user.id]
 
     if not user_vms:
-        keyboard = [[InlineKeyboardButton("🚀 立即建立 Windows", callback_data="btn_create_vm")]]
+        keyboard = [[InlineKeyboardButton("🚀 立即建立 VM", callback_data="btn_create_vm")]]
         await update.message.reply_text(
             "您目前沒有任何運行的臨時 VM。可點擊下方按鈕或使用 `/create_vm` 進行建立。",
             reply_markup=InlineKeyboardMarkup(keyboard),
@@ -762,7 +762,7 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         is_private = (chat.type == "private" or chat.id > 0)
         user_vms = [(rg, info) for rg, info in ACTIVE_VMS.items() if info["user_id"] == user.id]
         if not user_vms:
-            keyboard = [[InlineKeyboardButton("🚀 立即建立 Windows", callback_data="btn_create_vm")]]
+            keyboard = [[InlineKeyboardButton("🚀 立即建立 VM", callback_data="btn_create_vm")]]
             await query.message.reply_text(
                 "您目前沒有任何運行的臨時 VM。",
                 reply_markup=InlineKeyboardMarkup(keyboard)
@@ -827,7 +827,7 @@ async def text_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     user = update.effective_user
     chat = update.effective_chat
 
-    if text == "🚀 建立 Windows VM":
+    if text in ("🚀 建立臨時 VM", "🚀 建立 Windows VM"):
         await process_create_vm(update.message, user, chat, context)
     elif text == "🔍 查詢我的 VM":
         await my_vm_handler(update, context)
@@ -847,8 +847,8 @@ async def new_chat_members_handler(update: Update, context: ContextTypes.DEFAULT
     for member in update.message.new_chat_members:
         if member.id == bot_user.id:
             welcome_text = (
-                "👋 **大家好！我是 Azure 臨時 Windows VM 管理機器人。**\n\n"
-                "專為團隊提供臨時 Windows 測試主機（附隨機密碼、2 小時自動銷毀與定時防呆關機）。\n\n"
+                "👋 **大家好！我是 Azure 臨時 VM 管理機器人。**\n\n"
+                "專為團隊提供臨時 Windows / Linux 測試主機（附隨機密碼、2 小時自動銷毀與定時防呆關機）。\n\n"
                 "💡 **點擊下方按鈕或對話框左下角的「Menu」選單即可立即操作：**"
             )
             reply_markup = build_main_menu(member.id, is_private=False)
@@ -1180,7 +1180,7 @@ async def execute_deletion(message, rg_name: str, ip: str, user, is_edit: bool =
 async def post_init(application):
     """程式啟動後自動向 Telegram 註冊官方指令選單 (左下角 Menu 快捷鍵)"""
     commands = [
-        BotCommand("create_vm", "建立臨時 Windows (限群組)"),
+        BotCommand("create_vm", "建立臨時 VM (限群組)"),
         BotCommand("my_vm", "查詢我的 VM 狀態與剩餘時間"),
         BotCommand("delete_vm", "提前手動釋放 VM (按鈕選單)"),
         BotCommand("help", "顯示說明選單與功能按鈕"),
@@ -1217,7 +1217,7 @@ def main():
     # 註冊底部常駐鍵盤的文字按鈕處理器
     app.add_handler(
         MessageHandler(
-            filters.TEXT & filters.Regex(r"^(🚀 建立 Windows VM|🔍 查詢我的 VM|🗑 釋放/刪除 VM|❓ 使用說明|👑 管理員主控台)$"),
+            filters.TEXT & filters.Regex(r"^(🚀 建立臨時 VM|🚀 建立 Windows VM|🔍 查詢我的 VM|🗑 釋放/刪除 VM|❓ 使用說明|👑 管理員主控台)$"),
             text_button_handler
         )
     )
